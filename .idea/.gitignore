@@ -1,0 +1,26 @@
+# 默认忽略的文件
+/shelf/
+/workspace.xml
+# 基于编辑器的 HTTP 客户端请求
+/httpRequests/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+
+# 忽略所有 .pt 文件
+*.pt
+
+# 忽略 checkpoints 文件夹（如果还没加）
+checkpoints/
+
+# 忽略 .zip 文件
+*.zip
+
+data/
+
+PARSE/
+
+samples/
+
+samples_ct/
+
