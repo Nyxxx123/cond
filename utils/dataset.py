@@ -1,45 +1,61 @@
+"""
+条件数据集：肺动脉造影 + 2D血管掩码MIP（预计算.npy版本）
+数据组织方式：
+    data/
+    ├── angiographs/                    # 肺动脉造影图像（目标）
+    │   ├── patient001/
+    │   │   ├── patient001_0_mask.png
+    │   │   └── ...
+    │   └── patient002/
+    ├── mask/                           # 原始3D血管掩码（可选，保留）
+    │   ├── patient001.nii.gz
+    │   └── patient002.nii.gz
+    └── mask2D/                         # 预计算的2D MIP掩码（.npy格式）
+        ├── patient001_mip.npy
+        └── patient002_mip.npy
+"""
+
 import os
+import re
+import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
+from config import Config
+from utils.analyse_angle import get_angle_info
 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-
-class CTDataset(Dataset):
+class PulmonaryAngiographyDataset(Dataset):
     """
-    CT图像数据集
-    文件夹结构：
-        PARSE/
-        ├── patient1/           # 患者1文件夹（可选，支持子文件夹）
-        │   ├── ct_001.png
-        │   ├── ct_002.png
-        │   └── ...
-        ├── patient2/           # 患者2文件夹
-        │   ├── ct_001.png
-        │   └── ...
-        └── ct_image.png        # 也支持直接放在根目录
+    肺动脉造影数据集（使用预计算的.npy MIP掩码，保留float32精度）
     """
-    def __init__(self, root_dir, image_size=256, transform=None):
+
+    def __init__(self, root_dir, image_size=256, transform=None, device='cpu'):
         """
         Args:
-            root_dir: PARSE目录路径
-            image_size: 目标图像尺寸
-            transform: 自定义转换（如果不提供，使用默认）
+            root_dir: 数据根目录
+            image_size: 输出2D图像尺寸
+            transform: 图像变换
+            device: 设备
         """
         self.root_dir = root_dir
         self.image_size = image_size
+        self.device = device
+
+        # 目录路径
+        self.angiographs_dir = os.path.join(root_dir, 'angiographs')
+        self.mask_mip_dir = os.path.join(root_dir, 'mask2D')  # 使用预计算的.npy MIP
 
         # 存储所有图像路径
-        self.image_paths = []
+        self.image_list = []
 
-        # 递归收集所有图像
-        self._collect_images(root_dir)
+        # 收集数据
+        self._collect_data()
 
-        print(f"找到 {len(self.image_paths)} 张CT图像")
+        print(f"找到 {len(self.image_list)} 张造影图像")
 
-        # 定义默认转换
+        # 定义图像变换
         if transform is None:
             self.transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
@@ -49,67 +65,126 @@ class CTDataset(Dataset):
         else:
             self.transform = transform
 
-    def _collect_images(self, directory):
+    def _extract_info_from_filename(self, filename):
         """
-        递归收集目录下的所有图像
+        从文件名提取患者ID和视角序号
+        例如: patient001_0_mask.png -> ("patient001", 0)
         """
-        # 支持的图像格式
-        supported_extensions = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
+        pattern = r'(.+)_(\d+)_mask\.png$'
+        match = re.match(pattern, filename)
 
-        for root, dirs, files in os.walk(directory):
-            for file in files:
-                # 检查文件扩展名
-                ext = os.path.splitext(file)[1].lower()
-                if ext in supported_extensions:
-                    full_path = os.path.join(root, file)
-                    self.image_paths.append(full_path)
+        if match:
+            patient_id = match.group(1)
+            view_index = int(match.group(2))
+            return patient_id, view_index
+
+        raise ValueError(f"无法解析文件名: {filename}，期望格式: patient001_0_mask.png")
+
+    def _collect_data(self):
+        """收集所有造影图像和对应的MIP掩码路径"""
+        if not os.path.exists(self.angiographs_dir):
+            raise FileNotFoundError(f"目录不存在: {self.angiographs_dir}")
+
+        if not os.path.exists(self.mask_mip_dir):
+            raise FileNotFoundError(f"MIP目录不存在: {self.mask_mip_dir}\n请先运行 preprocess_masks.py")
+
+        # 遍历患者文件夹
+        patient_folders = sorted(os.listdir(self.angiographs_dir))
+
+        for patient_folder in patient_folders:
+            patient_angio_dir = os.path.join(self.angiographs_dir, patient_folder)
+
+            if not os.path.isdir(patient_angio_dir):
+                continue
+
+            # 查找对应的预计算MIP文件（.npy格式）
+            mip_path = os.path.join(self.mask_mip_dir, f"{patient_folder}_mip.npy")
+            if not os.path.exists(mip_path):
+                print(f"警告: 患者 {patient_folder} 的MIP文件不存在，跳过")
+                continue
+
+            # 收集该患者的所有造影图像
+            image_files = sorted(os.listdir(patient_angio_dir))
+            supported_ext = {'.png', '.jpg', '.jpeg', '.tif', '.tiff'}
+
+            for img_file in image_files:
+                ext = os.path.splitext(img_file)[1].lower()
+                if ext in supported_ext:
+                    try:
+                        patient_id, view_index = self._extract_info_from_filename(img_file)
+
+                        if patient_id != patient_folder:
+                            print(f"警告: 文件名中的患者ID({patient_id})与文件夹名({patient_folder})不一致，跳过")
+                            continue
+
+                        self.image_list.append({
+                            'image_path': os.path.join(patient_angio_dir, img_file),
+                            'mip_path': mip_path,
+                            'patient': patient_folder,
+                            'img_name': img_file,
+                            'view_index': view_index
+                        })
+                    except ValueError as e:
+                        print(f"警告: 跳过文件 {img_file}，{e}")
+
+    def _load_mip_mask(self, mip_path):
+        """
+        加载预计算的MIP掩码（.npy格式）并转换为张量
+        保留原始float32精度
+        """
+        # 加载.npy文件
+        mip_array = np.load(mip_path)  # [H, W], float32, 范围[0,1]
+
+        # 确保尺寸正确
+        if mip_array.shape != (self.image_size, self.image_size):
+            # 使用scipy进行resize（保持精度）
+            from scipy.ndimage import zoom
+            zoom_factors = (self.image_size / mip_array.shape[0],
+                            self.image_size / mip_array.shape[1])
+            mip_array = zoom(mip_array, zoom_factors, order=1)
+
+        # 转换为torch张量并添加通道维度
+        mip_tensor = torch.from_numpy(mip_array).float().unsqueeze(0)  # [1, H, W]
+
+        return mip_tensor
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.image_list)
 
     def __getitem__(self, idx):
-        """
-        返回：
-            image: CT图像 [1, H, W] 归一化到[-1,1]
-            dummy_label: 0（保持接口兼容）
-        """
-        img_path = self.image_paths[idx]
+        item = self.image_list[idx]
 
-        # 加载图像（转为灰度图）
-        image = Image.open(img_path).convert('L')
+        # 加载造影图像（目标）
+        angio_image = Image.open(item['image_path']).convert('L')
+        target_tensor = self.transform(angio_image)  # [1, H, W]
 
-        # 应用转换
-        image = self.transform(image)
+        # 加载预计算的MIP掩码（.npy格式，高精度）
+        mask_mip = self._load_mip_mask(item['mip_path'])  # [1, H, W]
 
-        # 返回图像和虚拟标签（保持与原有训练代码接口一致）
-        return image, 0
+        # 解析角度信息（从文件名）
+        angle_info = get_angle_info(item['img_name'])
 
-    def get_stats(self, num_samples=100):
-        """
-        可选：计算数据集的统计信息
-        """
-        print("计算数据集统计信息...")
-        all_images = []
-        for i in range(min(num_samples, len(self))):
-            img, _ = self[i]
-            all_images.append(img.numpy())
-
-        import numpy as np
-        all_images = np.array(all_images)
-        print(f"  Mean: {all_images.mean():.4f}")
-        print(f"  Std: {all_images.std():.4f}")
-        print(f"  Min: {all_images.min():.4f}")
-        print(f"  Max: {all_images.max():.4f}")
-        return all_images.mean(), all_images.std()
+        return {
+            'target': target_tensor,                      # 目标造影图 [1, H, W]
+            'mask': mask_mip,                             # 条件：2D MIP掩码 [1, H, W] (float32)
+            'angle_matrix': angle_info['rotation_matrix'], # 旋转矩阵 [9]
+            'angle_deg': angle_info['angle_deg'],         # 角度（度数）
+            'view_index': angle_info['view_index'],       # 视角序号
+            'patient': item['patient'],
+            'img_name': item['img_name']
+        }
 
 
-def create_ct_dataloader(config, shuffle=True):
+def create_dataloader(shuffle=True):
     """
-    创建CT数据集的DataLoader
+    创建DataLoader
     """
-    dataset = CTDataset(
+    config = Config()
+
+    dataset = PulmonaryAngiographyDataset(
         root_dir=config.data_dir,
-        image_size=config.image_size
+        image_size=config.image_size,
+        device='cpu'
     )
 
     dataloader = torch.utils.data.DataLoader(
@@ -118,7 +193,7 @@ def create_ct_dataloader(config, shuffle=True):
         shuffle=shuffle,
         num_workers=4,
         pin_memory=True,
-        drop_last=True  # 丢弃最后一个不完整的batch
+        drop_last=True
     )
 
     return dataloader
@@ -128,55 +203,43 @@ def create_ct_dataloader(config, shuffle=True):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    print("=" * 50)
-    print("测试CT数据集...")
-    print("=" * 50)
+    config = Config()
 
-    # 测试配置
-    class TestConfig:
-        data_dir = "../PARSE"
-        image_size = 512
-        batch_size = 4
+    # 使用脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, "..")  # 假设dataset.py在utils/下
 
-    config = TestConfig()
+    if os.path.exists(os.path.join(data_dir, "angiographs")):
+        dataset = PulmonaryAngiographyDataset(
+            root_dir=data_dir,
+            image_size=config.image_size
+        )
 
-    # 检查目录
-    if not os.path.exists(config.data_dir):
-        print(f"错误: 目录 {config.data_dir} 不存在！")
-        print("请创建 PARSE 目录并放入CT图像")
-        exit(1)
+        if len(dataset) > 0:
+            sample = dataset[0]
+            print(f"Target形状: {sample['target'].shape}")
+            print(f"Mask形状: {sample['mask'].shape}")
+            print(f"Mask数据类型: {sample['mask'].dtype}")
+            print(f"Mask范围: [{sample['mask'].min():.6f}, {sample['mask'].max():.6f}]")
+            print(f"Mask精度: {sample['mask'][0, 100, 100].item():.8f}")  # 显示高精度值
 
-    # 创建数据集
-    dataset = CTDataset(config.data_dir, config.image_size)
+            # 可视化
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            target_disp = (sample['target'][0].numpy() + 1) / 2
+            mask_disp = sample['mask'][0].numpy()
 
-    if len(dataset) == 0:
-        print(f"错误: 在 {config.data_dir} 中没有找到图像！")
-        print("请确保目录下包含 PNG/JPG 等格式的CT图像")
-        exit(1)
+            axes[0].imshow(target_disp, cmap='gray')
+            axes[0].set_title("造影图像 (目标)")
+            axes[0].axis('off')
 
-    # 创建DataLoader
-    dataloader = create_ct_dataloader(config)
+            im = axes[1].imshow(mask_disp, cmap='hot')
+            axes[1].set_title("MIP掩码 (条件)\n.npy格式, float32精度")
+            axes[1].axis('off')
+            plt.colorbar(im, ax=axes[1], fraction=0.046)
 
-    # 获取一个batch
-    for images, labels in dataloader:
-        print(f"Batch形状: {images.shape}")
-        print(f"标签形状: {labels.shape}")
-        print(f"数值范围: [{images.min():.3f}, {images.max():.3f}]")
-
-        # 可视化
-        fig, axes = plt.subplots(1, min(4, images.shape[0]), figsize=(12, 3))
-        if images.shape[0] == 1:
-            axes = [axes]
-
-        for i, ax in enumerate(axes):
-            # 反归一化到[0,1]显示
-            img_display = (images[i, 0].numpy() + 1) / 2
-            ax.imshow(img_display, cmap='gray')
-            ax.axis('off')
-            ax.set_title(f"CT {i+1}")
-
-        plt.tight_layout()
-        plt.savefig("./ct_sample.png", dpi=150)
-        print(f"\n已保存示例到 ./ct_sample.png")
-        plt.show()
-        break
+            plt.tight_layout()
+            plt.show()
+        else:
+            print("没有找到数据，请先运行 preprocess_masks.py")
+    else:
+        print(f"目录不存在，请确认路径")
