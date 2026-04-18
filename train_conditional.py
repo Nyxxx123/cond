@@ -1,6 +1,6 @@
 """
 条件扩散模型训练脚本 - 肺动脉造影版本
-使用血管掩码MIP作为条件
+使用血管掩码作为条件（支持2D MIP或3D原始掩码）
 """
 
 import os
@@ -37,7 +37,7 @@ def train_one_epoch(model, diffusion, dataloader, optimizer, config, epoch):
     for batch_idx, batch in enumerate(pbar):
         # 获取数据（条件数据集返回字典）
         targets = batch['target'].to(config.device)  # 造影图像 [B,1,H,W]
-        masks = batch['mask'].to(config.device)      # MIP掩码 [B,1,H,W]
+        masks = batch['mask'].to(config.device)      # 掩码（2D或3D）
         batch_size = targets.shape[0]
 
         # 随机采样时间步
@@ -77,16 +77,20 @@ def sample_and_save(model, diffusion, dataloader, config, epoch):
         test_masks = batch['mask'][:config.sample_batch_size].to(config.device)
         break
 
+    # 关键修改：获取实际batch大小
+    actual_batch_size = test_masks.shape[0]
+    num_samples = actual_batch_size  # 使用实际数量，而不是config.sample_batch_size
+
     with torch.no_grad():
         samples, intermediates = diffusion.sample(
             model,
             config.image_size,
-            batch_size=config.sample_batch_size,
+            batch_size=num_samples,  # 使用实际数量
             channels=config.channels,
             sampler_type=config.sampler_type,
             ddim_steps=config.ddim_steps,
             eta=config.ddim_eta,
-            cond=test_masks,  # 传入条件
+            cond=test_masks,
             progress=True
         )
 
@@ -98,16 +102,22 @@ def sample_and_save(model, diffusion, dataloader, config, epoch):
         save_image(samples, save_path, nrow=4)
 
         # 保存条件掩码和生成结果的对比图
-        fig, axes = plt.subplots(2, min(8, config.sample_batch_size),
-                                  figsize=(2 * min(8, config.sample_batch_size), 4))
-        if min(8, config.sample_batch_size) == 1:
+        # 关键修改：使用实际数量，最多显示8个
+        display_num = min(8, num_samples)
+        fig, axes = plt.subplots(2, display_num,
+                                 figsize=(2 * display_num, 4))
+        if display_num == 1:
             axes = axes.reshape(-1, 1)
 
-        for i in range(min(8, config.sample_batch_size)):
-            # 第一行：条件掩码
+        for i in range(display_num):
+            # 第一行：条件掩码（支持2D和3D）
             mask_disp = test_masks[i, 0].cpu().numpy()
+            # 如果是3D掩码，取中间切片显示
+            if mask_disp.ndim == 3:
+                mid_slice = mask_disp.shape[0] // 2
+                mask_disp = mask_disp[mid_slice]
             axes[0, i].imshow(mask_disp, cmap='hot')
-            axes[0, i].set_title("Condition (MIP)", fontsize=8)
+            axes[0, i].set_title("Condition", fontsize=8)
             axes[0, i].axis('off')
 
             # 第二行：生成结果
@@ -192,6 +202,7 @@ def main():
     config = Config()
     print(f"Using device: {config.device}")
     print(f"Data directory: {config.data_dir}")
+    print(f"Mask type: {config.mask_type}")  # 新增：打印掩码类型
     print(f"Condition block type: {config.cond_block_type}")
 
     # 创建目录
@@ -205,8 +216,11 @@ def main():
         sample_dataloader = prepare_data(shuffle=False)  # 用于采样可视化
         if len(train_dataloader) == 0:
             print("Error: No data found! Please check the directory structure.")
-            print(f"Expected: {config.data_dir}/angiographs/patient/img_xxx.png")
-            print(f"          {config.data_dir}/mask2D/patient_mip.npy")
+            print(f"Expected: {config.data_dir}/angiographs/patient/patient_X_mask.png")
+            if config.mask_type == "2d":
+                print(f"          {config.data_dir}/mask2D/patient_mip.npy")
+            else:
+                print(f"          {config.data_dir}/mask/patient.nii.gz")
             return
         print(f"Number of batches: {len(train_dataloader)}")
         print(f"Total images: {len(train_dataloader.dataset)}")
@@ -221,7 +235,7 @@ def main():
     # 创建扩散过程
     diffusion = GaussianDiffusion(betas, config.device)
 
-    # 创建模型
+    # 创建模型（修改点1：添加 mask_type 参数）
     print("Creating model...")
     model = ConditionalUNet(
         in_channels=config.channels,
@@ -229,7 +243,8 @@ def main():
         base_channels=config.base_channels,
         cond_dim=config.cond_dim,
         time_emb_dim=config.time_emb_dim,
-        block_type=config.cond_block_type
+        block_type=config.cond_block_type,
+        mask_type=config.mask_type  # 新增这一行
     ).to(config.device)
 
     # 打印模型参数量
@@ -292,7 +307,8 @@ def main():
                 'config': {
                     'learning_rate': config.learning_rate,
                     'batch_size': config.batch_size,
-                    'cond_block_type': config.cond_block_type
+                    'cond_block_type': config.cond_block_type,
+                    'mask_type': config.mask_type  # 新增
                 }
             }, save_dir=config.checkpoint_dir)
 
@@ -306,7 +322,8 @@ def main():
         'config': {
             'learning_rate': config.learning_rate,
             'batch_size': config.batch_size,
-            'cond_block_type': config.cond_block_type
+            'cond_block_type': config.cond_block_type,
+            'mask_type': config.mask_type  # 新增
         }
     }, save_dir=config.checkpoint_dir)
 

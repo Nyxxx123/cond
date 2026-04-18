@@ -8,13 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from models.mask_encoder import MaskEncoder2D
+from models.encoder import MaskEncoder2D, MaskEncoder3D  # 修改：从encoder导入
 from models.cond_attention import ConditionedBlock, AddConditionBlock
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
     """正弦位置编码"""
-
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -35,7 +34,7 @@ class ConditionalUNet(nn.Module):
 
     输入:
         x: 噪声图像 [B, 1, H, W]
-        mask_mip: 血管掩码MIP [B, 1, H, W]
+        mask: 血管掩码（2D: [B,1,H,W] 或 3D: [B,1,D,H,W]）
         t: 时间步 [B]
 
     输出:
@@ -48,11 +47,13 @@ class ConditionalUNet(nn.Module):
                  base_channels=64,
                  cond_dim=256,
                  time_emb_dim=256,
-                 block_type="cross_attention"):  # "add" 或 "cross_attention"
+                 block_type="cross_attention",
+                 mask_type="3d"):  # 新增参数： "2d" 或 "3d"
         super().__init__()
 
         self.base_channels = base_channels
         self.cond_dim = cond_dim
+        self.mask_type = mask_type
 
         # 选择条件块类型
         if block_type == "add":
@@ -60,10 +61,11 @@ class ConditionalUNet(nn.Module):
         else:
             BlockClass = ConditionedBlock
 
-        '''这里我把Block放到attention里面实现'''
-
-        # 掩码编码器（将2D MIP编码为条件向量）
-        self.mask_encoder = MaskEncoder2D(in_channels=1, cond_dim=cond_dim)
+        # 根据类型选择编码器（修改：动态选择）
+        if mask_type == "2d":
+            self.mask_encoder = MaskEncoder2D(in_channels=1, cond_dim=cond_dim)
+        else:
+            self.mask_encoder = MaskEncoder3D(in_channels=1, cond_dim=cond_dim)
 
         # 时间步嵌入
         self.time_mlp = nn.Sequential(
@@ -73,7 +75,7 @@ class ConditionalUNet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim),
         )
 
-        # 初始卷积（只接收噪声图像）
+        # 初始卷积
         self.init_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
 
         # 编码器
@@ -108,20 +110,20 @@ class ConditionalUNet(nn.Module):
             tensor = F.interpolate(tensor, size=target_size, mode='bilinear', align_corners=False)
         return tensor
 
-    def forward(self, x, mask_mip, t):
+    def forward(self, x, mask, t):
         """
         Args:
             x: 噪声图像 [B, 1, H, W]
-            mask_mip: MIP后的2D血管掩码 [B, 1, H, W]
+            mask: 血管掩码（2D或3D）
             t: 时间步 [B]
         """
         original_size = x.shape[-2:]
 
         # 编码条件
-        cond = self.mask_encoder(mask_mip)  # [B, cond_dim]
+        cond = self.mask_encoder(mask)  # [B, cond_dim]
 
         # 时间嵌入
-        t_emb = self.time_mlp(t)  # [B, time_emb_dim]
+        t_emb = self.time_mlp(t)
 
         # 初始卷积
         h = self.init_conv(x)
@@ -167,76 +169,3 @@ class ConditionalUNet(nn.Module):
             output = self.adjust_size(output, original_size)
 
         return output
-
-    def forward_with_precomputed_cond(self, x, cond, t):
-        """
-        使用预计算的条件向量前向传播（用于采样时加速）
-        """
-        original_size = x.shape[-2:]
-        t_emb = self.time_mlp(t)
-
-        h = self.init_conv(x)
-
-        e1 = self.enc1(h, t_emb, cond)
-        e1_size = e1.shape[-2:]
-
-        e2 = self.enc2(self.downsample(e1), t_emb, cond)
-        e2_size = e2.shape[-2:]
-
-        e3 = self.enc3(self.downsample(e2), t_emb, cond)
-        e3_size = e3.shape[-2:]
-
-        e4 = self.enc4(self.downsample(e3), t_emb, cond)
-        e4_size = e4.shape[-2:]
-
-        b = self.bottleneck(self.downsample(e4), t_emb, cond)
-
-        b_up = self.upsample(b)
-        b_up = self.adjust_size(b_up, e4_size)
-        d4 = self.dec4(torch.cat([b_up, e4], dim=1), t_emb, cond)
-
-        d4_up = self.upsample(d4)
-        d4_up = self.adjust_size(d4_up, e3_size)
-        d3 = self.dec3(torch.cat([d4_up, e3], dim=1), t_emb, cond)
-
-        d3_up = self.upsample(d3)
-        d3_up = self.adjust_size(d3_up, e2_size)
-        d2 = self.dec2(torch.cat([d3_up, e2], dim=1), t_emb, cond)
-
-        d2_up = self.upsample(d2)
-        d2_up = self.adjust_size(d2_up, e1_size)
-        d1 = self.dec1(torch.cat([d2_up, e1], dim=1), t_emb, cond)
-
-        output = self.out_conv(d1)
-
-        if output.shape[-2:] != original_size:
-            output = self.adjust_size(output, original_size)
-
-        return output
-
-
-# 测试代码
-if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # 测试两种条件块
-    for block_type in ["add", "cross_attention"]:
-        print(f"\n测试 block_type={block_type}")
-        model = ConditionalUNet(
-            in_channels=1,
-            out_channels=1,
-            base_channels=32,
-            cond_dim=256,
-            block_type=block_type
-        ).to(device)
-
-        x = torch.randn(2, 1, 256, 256).to(device)
-        mask = torch.rand(2, 1, 256, 256).to(device)
-        t = torch.randint(0, 1000, (2,)).to(device)
-
-        with torch.no_grad():
-            out = model(x, mask, t)
-
-        print(f"输入形状: {x.shape}")
-        print(f"输出形状: {out.shape}")
-        print(f"参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")

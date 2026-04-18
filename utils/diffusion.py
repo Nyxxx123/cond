@@ -132,21 +132,19 @@ class GaussianDiffusion:
                     cond=None, progress=True):
         """
         完整DDPM采样循环（支持条件）
-
-        Args:
-            model: 条件UNet
-            image_size: 图像尺寸
-            batch_size: 批次大小
-            channels: 通道数
-            cond: 条件（如MIP掩码）[B, 1, H, W] 或 None
-            progress: 是否显示进度条
         """
         shape = (batch_size, channels, image_size, image_size)
         img = torch.randn(shape, device=self.device)
 
-        # 如果条件存在但batch不匹配，则复制
+        # 如果条件存在但batch不匹配，则复制（支持2D和3D）
         if cond is not None and cond.shape[0] != batch_size:
-            cond = cond.repeat(batch_size, 1, 1, 1)
+            # 根据cond的维度决定repeat参数
+            if cond.dim() == 4:  # 2D掩码 [B,1,H,W]
+                cond = cond.repeat(batch_size, 1, 1, 1)
+            elif cond.dim() == 5:  # 3D掩码 [B,1,D,H,W]
+                cond = cond.repeat(batch_size, 1, 1, 1, 1)
+            else:
+                raise ValueError(f"Unsupported cond dimension: {cond.dim()}")
 
         intermediates = []
         indices = list(range(self.timesteps))[::-1]
@@ -212,9 +210,15 @@ class GaussianDiffusion:
         shape = (batch_size, channels, image_size, image_size)
         img = torch.randn(shape, device=self.device)
 
-        # 如果条件存在但batch不匹配，则复制
+        # 如果条件存在但batch不匹配，则复制（支持2D和3D）
         if cond is not None and cond.shape[0] != batch_size:
-            cond = cond.repeat(batch_size, 1, 1, 1)
+            # 根据cond的维度决定repeat参数
+            if cond.dim() == 4:  # 2D掩码 [B,1,H,W]
+                cond = cond.repeat(batch_size, 1, 1, 1)
+            elif cond.dim() == 5:  # 3D掩码 [B,1,D,H,W]
+                cond = cond.repeat(batch_size, 1, 1, 1, 1)
+            else:
+                raise ValueError(f"Unsupported cond dimension: {cond.dim()}")
 
         intermediates = []
 

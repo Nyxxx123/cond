@@ -21,6 +21,9 @@ class Config:
     ddim_steps = 50            # DDIM 采样步数（20-100，越高质量越好但越慢）
     ddim_eta = 0.0             # DDIM 随机性（0=确定性，1=DDPM风格）
 
+    #掩码适配参数
+    mask_type = "3d"  # "2d" 或 "3d"：使用2D MIP还是3D原始掩码
+    mask_3d_size = (64, 64, 64)  # 3D掩码下采样尺寸 (D, H, W)
     # MIP投影参数
     mip_projection_axis = 2  # 0=X轴（前后方向），1=Y轴，2=Z轴 （右手系）
 
@@ -50,5 +53,5 @@ class Config:
     sample_frequency = 25  # 每5个epoch采样一次
 
     # 日志和保存
-    checkpoint_dir = "./checkpoints_ct"
-    sample_dir = "./samples_ct"
+    checkpoint_dir = "./checkpoints_ct_3d"
+    sample_dir = "./samples_ct_3d"
