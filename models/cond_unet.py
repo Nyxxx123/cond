@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from models.encoder import MaskEncoder2D, MaskEncoder3D  # 修改：从encoder导入
+from models.encoder import MaskEncoder2D, MaskEncoder3D, MultiConditionEncoder  # 修改：从encoder导入
 from models.cond_attention import ConditionedBlock, AddConditionBlock
 
 
@@ -30,15 +30,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 class ConditionalUNet(nn.Module):
     """
-    条件U-Net
-
-    输入:
-        x: 噪声图像 [B, 1, H, W]
-        mask: 血管掩码（2D: [B,1,H,W] 或 3D: [B,1,D,H,W]）
-        t: 时间步 [B]
-
-    输出:
-        预测噪声 [B, 1, H, W]
+    条件U-Net（支持掩码+角度多条件）
     """
 
     def __init__(self,
@@ -48,12 +40,13 @@ class ConditionalUNet(nn.Module):
                  cond_dim=256,
                  time_emb_dim=256,
                  block_type="cross_attention",
-                 mask_type="3d"):  # 新增参数： "2d" 或 "3d"
+                 mask_type="3d",
+                 use_angle=True,
+                 angle_dim=4):
         super().__init__()
 
         self.base_channels = base_channels
         self.cond_dim = cond_dim
-        self.mask_type = mask_type
 
         # 选择条件块类型
         if block_type == "add":
@@ -61,11 +54,15 @@ class ConditionalUNet(nn.Module):
         else:
             BlockClass = ConditionedBlock
 
-        # 根据类型选择编码器（修改：动态选择）
-        if mask_type == "2d":
-            self.mask_encoder = MaskEncoder2D(in_channels=1, cond_dim=cond_dim)
-        else:
-            self.mask_encoder = MaskEncoder3D(in_channels=1, cond_dim=cond_dim)
+        # 多条件编码器（融合掩码和角度）
+        self.cond_encoder = MultiConditionEncoder(
+            mask_type=mask_type,
+            mask_cond_dim=cond_dim,
+            angle_cond_dim=cond_dim,
+            use_angle=use_angle,
+            angle_dim=angle_dim,
+            fused_cond_dim=cond_dim
+        )
 
         # 时间步嵌入
         self.time_mlp = nn.Sequential(
@@ -105,30 +102,29 @@ class ConditionalUNet(nn.Module):
         )
 
     def adjust_size(self, tensor, target_size):
-        """调整张量尺寸"""
         if tensor.shape[-2:] != target_size:
             tensor = F.interpolate(tensor, size=target_size, mode='bilinear', align_corners=False)
         return tensor
 
-    def forward(self, x, mask, t):
+    def forward(self, x, mask, angle=None, t=None):
         """
         Args:
             x: 噪声图像 [B, 1, H, W]
             mask: 血管掩码（2D或3D）
+            angle: 角度表示 [B, angle_dim]（四元数/旋转矩阵）
             t: 时间步 [B]
         """
         original_size = x.shape[-2:]
 
-        # 编码条件
-        cond = self.mask_encoder(mask)  # [B, cond_dim]
+        # 多条件编码（融合掩码和角度）
+        cond = self.cond_encoder(mask, angle)  # [B, cond_dim]
 
         # 时间嵌入
         t_emb = self.time_mlp(t)
 
-        # 初始卷积
+        # U-Net前向传播（与之前相同）
         h = self.init_conv(x)
 
-        # 编码器
         e1 = self.enc1(h, t_emb, cond)
         e1_size = e1.shape[-2:]
 
@@ -141,10 +137,8 @@ class ConditionalUNet(nn.Module):
         e4 = self.enc4(self.downsample(e3), t_emb, cond)
         e4_size = e4.shape[-2:]
 
-        # 瓶颈
         b = self.bottleneck(self.downsample(e4), t_emb, cond)
 
-        # 解码器
         b_up = self.upsample(b)
         b_up = self.adjust_size(b_up, e4_size)
         d4 = self.dec4(torch.cat([b_up, e4], dim=1), t_emb, cond)
@@ -161,10 +155,8 @@ class ConditionalUNet(nn.Module):
         d2_up = self.adjust_size(d2_up, e1_size)
         d1 = self.dec1(torch.cat([d2_up, e1], dim=1), t_emb, cond)
 
-        # 输出
         output = self.out_conv(d1)
 
-        # 确保尺寸一致
         if output.shape[-2:] != original_size:
             output = self.adjust_size(output, original_size)
 

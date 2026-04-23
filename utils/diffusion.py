@@ -70,56 +70,34 @@ class GaussianDiffusion:
 
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
-    def p_losses(self, model, x_start, t, cond=None, noise=None):
-        """
-        计算训练损失（支持条件）
-
-        Args:
-            model: 条件UNet模型
-            x_start: 原始图像 [B, C, H, W]
-            t: 时间步 [B]
-            cond: 条件（如MIP掩码）[B, 1, H, W]
-            noise: 噪声（可选）
-        """
+    def p_losses(self, model, x_start, t, mask=None, angle=None, noise=None):
         if noise is None:
             noise = torch.randn_like(x_start)
 
         x_noisy = self.q_sample(x_start, t, noise)
 
-        # 条件前向传播
-        if cond is not None:
-            predicted_noise = model(x_noisy, cond, t)
-        else:
-            predicted_noise = model(x_noisy, t)
+        # 传入多条件
+        predicted_noise = model(x_noisy, mask, angle=angle, t=t)
 
         return F.mse_loss(predicted_noise, noise)
 
+    # 修改 p_sample 方法
     @torch.no_grad()
-    def p_sample(self, model, x, t, t_index, cond=None):
-        """
-        单步逆向采样（支持条件）
-        """
+    def p_sample(self, model, x, t, t_index, mask=None, angle=None):
         t = t.long().to(self.device)
 
-        # 提取参数
         betas_t = self._extract(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = self._extract(
             self.sqrt_one_minus_alphas_cumprod, t, x.shape
         )
         sqrt_recip_alphas_t = 1.0 / torch.sqrt(self._extract(self.alphas, t, x.shape))
 
-        # 预测噪声（条件）
-        if cond is not None:
-            predicted_noise = model(x, cond, t)
-        else:
-            predicted_noise = model(x, t)
+        predicted_noise = model(x, mask, angle=angle, t=t)
 
-        # 计算均值
         model_mean = sqrt_recip_alphas_t * (
-            x - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t
+                x - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t
         )
 
-        # 如果不是最后一步，添加噪声
         if t_index == 0:
             return model_mean
         else:
@@ -129,22 +107,31 @@ class GaussianDiffusion:
 
     @torch.no_grad()
     def sample_ddpm(self, model, image_size, batch_size=16, channels=1,
-                    cond=None, progress=True):
+                    mask=None, angle=None, progress=True):
         """
         完整DDPM采样循环（支持条件）
+
+        Args:
+            model: 条件UNet
+            image_size: 图像尺寸
+            batch_size: 批次大小
+            channels: 通道数
+            mask: 掩码条件（2D或3D）
+            angle: 角度条件（四元数）
+            progress: 是否显示进度条
         """
         shape = (batch_size, channels, image_size, image_size)
         img = torch.randn(shape, device=self.device)
 
-        # 如果条件存在但batch不匹配，则复制（支持2D和3D）
-        if cond is not None and cond.shape[0] != batch_size:
-            # 根据cond的维度决定repeat参数
-            if cond.dim() == 4:  # 2D掩码 [B,1,H,W]
-                cond = cond.repeat(batch_size, 1, 1, 1)
-            elif cond.dim() == 5:  # 3D掩码 [B,1,D,H,W]
-                cond = cond.repeat(batch_size, 1, 1, 1, 1)
-            else:
-                raise ValueError(f"Unsupported cond dimension: {cond.dim()}")
+        # 如果条件存在但batch不匹配，则复制
+        if mask is not None and mask.shape[0] != batch_size:
+            if mask.dim() == 4:
+                mask = mask.repeat(batch_size, 1, 1, 1)
+            elif mask.dim() == 5:
+                mask = mask.repeat(batch_size, 1, 1, 1, 1)
+
+        if angle is not None and angle.shape[0] != batch_size:
+            angle = angle.repeat(batch_size, 1)
 
         intermediates = []
         indices = list(range(self.timesteps))[::-1]
@@ -154,7 +141,8 @@ class GaussianDiffusion:
 
         for i in indices:
             t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-            img = self.p_sample(model, img, t, i, cond=cond)
+            # 修改这里：传入 mask 和 angle，不再用 cond
+            img = self.p_sample(model, img, t, i, mask=mask, angle=angle)
 
             if i % 100 == 0 or i == self.timesteps - 1 or i == 0:
                 intermediates.append(img.cpu())
@@ -162,11 +150,10 @@ class GaussianDiffusion:
         return img, intermediates
 
     @torch.no_grad()
-    def sample_timestep_ddim(self, model, x, t, cond=None, eta=0.0):
+    def sample_timestep_ddim(self, model, x, t, mask=None, angle=None, eta=0.0):
         """
-        DDIM 单步采样（支持条件）
+        DDIM 单步采样
         """
-        # 获取当前时间步的参数
         alpha_cumprod_t = self._extract(self.alphas_cumprod, t, x.shape)
         alpha_cumprod_t_prev = self._extract(self.alphas_cumprod_prev, t, x.shape)
 
@@ -174,64 +161,51 @@ class GaussianDiffusion:
         sqrt_alpha_cumprod_t_prev = torch.sqrt(alpha_cumprod_t_prev)
         sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alpha_cumprod_t)
 
-        # 预测噪声（条件）
-        if cond is not None:
-            eps_theta = model(x, cond, t)
-        else:
-            eps_theta = model(x, t)
+        # 预测噪声（传入mask和angle）
+        eps_theta = model(x, mask, angle=angle, t=t)
 
-        # 预测 x0
         x0_pred = (x - sqrt_one_minus_alpha_cumprod_t * eps_theta) / sqrt_alpha_cumprod_t
         x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
 
-        # 计算 sigma
         sigma = eta * torch.sqrt(
             (1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) *
             (1 - alpha_cumprod_t / alpha_cumprod_t_prev)
         )
 
-        # 生成噪声
         noise = torch.randn_like(x) if eta > 0 else 0
-
-        # 计算方向
-        dir_xt = torch.sqrt(1 - alpha_cumprod_t_prev - sigma**2) * eps_theta
-
-        # 更新
+        dir_xt = torch.sqrt(1 - alpha_cumprod_t_prev - sigma ** 2) * eps_theta
         x_prev = sqrt_alpha_cumprod_t_prev * x0_pred + dir_xt + sigma * noise
 
         return x_prev
 
     @torch.no_grad()
     def sample_ddim(self, model, image_size, batch_size=16, channels=1,
-                    ddim_steps=50, eta=0.0, cond=None, progress=True):
+                    ddim_steps=50, eta=0.0, mask=None, angle=None, progress=True):
         """
         DDIM 快速采样（支持条件）
         """
         shape = (batch_size, channels, image_size, image_size)
         img = torch.randn(shape, device=self.device)
 
-        # 如果条件存在但batch不匹配，则复制（支持2D和3D）
-        if cond is not None and cond.shape[0] != batch_size:
-            # 根据cond的维度决定repeat参数
-            if cond.dim() == 4:  # 2D掩码 [B,1,H,W]
-                cond = cond.repeat(batch_size, 1, 1, 1)
-            elif cond.dim() == 5:  # 3D掩码 [B,1,D,H,W]
-                cond = cond.repeat(batch_size, 1, 1, 1, 1)
-            else:
-                raise ValueError(f"Unsupported cond dimension: {cond.dim()}")
+        # 复制条件到batch维度
+        if mask is not None and mask.shape[0] != batch_size:
+            if mask.dim() == 4:
+                mask = mask.repeat(batch_size, 1, 1, 1)
+            elif mask.dim() == 5:
+                mask = mask.repeat(batch_size, 1, 1, 1, 1)
+
+        if angle is not None and angle.shape[0] != batch_size:
+            angle = angle.repeat(batch_size, 1)
 
         intermediates = []
-
-        # 生成时间步序列
-        ddim_timesteps = np.linspace(0, self.timesteps - 1, ddim_steps, dtype=int)
-        ddim_timesteps = ddim_timesteps[::-1]
+        ddim_timesteps = np.linspace(0, self.timesteps - 1, ddim_steps, dtype=int)[::-1]
 
         if progress:
             pbar = tqdm(range(len(ddim_timesteps)), desc="DDIM Sampling")
 
         for i, step in enumerate(ddim_timesteps):
             t = torch.full((batch_size,), step, device=self.device, dtype=torch.long)
-            img = self.sample_timestep_ddim(model, img, t, cond=cond, eta=eta)
+            img = self.sample_timestep_ddim(model, img, t, mask=mask, angle=angle, eta=eta)
             img = torch.clamp(img, -1.0, 1.0)
 
             if i % max(1, len(ddim_timesteps) // 10) == 0 or i == len(ddim_timesteps) - 1:
@@ -248,115 +222,36 @@ class GaussianDiffusion:
     @torch.no_grad()
     def sample(self, model, image_size, batch_size=16, channels=1,
                sampler_type="ddpm", ddim_steps=50, eta=0.0,
-               cond=None, progress=True):
+               mask=None, angle=None, progress=True):
         """
-        统一的采样接口（支持条件）
-
-        Args:
-            model: 条件UNet
-            image_size: 图像尺寸
-            batch_size: 批次大小
-            channels: 通道数
-            sampler_type: "ddpm" 或 "ddim"
-            ddim_steps: DDIM采样步数
-            eta: DDIM随机性
-            cond: 条件（如MIP掩码）[B, 1, H, W] 或 None
-            progress: 是否显示进度条
+        统一的采样接口
         """
         if sampler_type == "ddpm":
             return self.sample_ddpm(model, image_size, batch_size, channels,
-                                    cond=cond, progress=progress)
+                                    mask=mask, angle=angle, progress=progress)
         elif sampler_type == "ddim":
             return self.sample_ddim(model, image_size, batch_size, channels,
-                                    ddim_steps, eta, cond=cond, progress=progress)
+                                    ddim_steps, eta, mask=mask, angle=angle, progress=progress)
         else:
             raise ValueError(f"Unknown sampler type: {sampler_type}")
 
+    # 添加lpips
+    def predict_x0_from_noise(self, x_t, noise_pred, t):
+        """
+        从噪声图像和预测的噪声还原x0
 
-# 测试函数
-def test_diffusion():
-    """
-    测试条件扩散过程
-    """
-    from models.cond_unet import ConditionalUNet
+        Args:
+            x_t: 噪声图像 [B, C, H, W]
+            noise_pred: 预测的噪声 [B, C, H, W]
+            t: 时间步 [B]
 
-    print("=" * 50)
-    print("测试条件扩散过程（DDPM + DDIM）...")
-    print("=" * 50)
+        Returns:
+            x0_pred: 预测的干净图像 [B, C, H, W]
+        """
+        sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_t.shape)
+        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
+        x0_pred = (x_t - sqrt_one_minus_alphas_cumprod_t * noise_pred) / sqrt_alphas_cumprod_t
+        x0_pred = torch.clamp(x0_pred, -1.0, 1.0)  # 限制范围
 
-    # 创建简单的噪声调度
-    timesteps = 100
-    betas = torch.linspace(0.0001, 0.02, timesteps)
-
-    # 创建扩散过程
-    diffusion = GaussianDiffusion(betas, device)
-
-    # 创建条件模型
-    model = ConditionalUNet(
-        in_channels=1,
-        out_channels=1,
-        base_channels=32,
-        cond_dim=256,
-        block_type="cross_attention",
-    ).to(device)
-    model.eval()
-
-    # 测试前向扩散（带条件）
-    print("\n测试前向扩散（带条件）:")
-    x = torch.randn(2, 1, 28, 28).to(device)
-    mask = torch.rand(2, 1, 28, 28).to(device)
-    t = torch.randint(0, timesteps, (2,)).to(device)
-
-    x_noisy = diffusion.q_sample(x, t)
-    print(f"原始图像形状: {x.shape}")
-    print(f"条件掩码形状: {mask.shape}")
-    print(f"加噪后图像形状: {x_noisy.shape}")
-
-    # 测试损失计算
-    loss = diffusion.p_losses(model, x, t, cond=mask)
-    print(f"条件损失: {loss.item():.4f}")
-
-    # 测试 DDPM 条件采样
-    print("\n测试 DDPM 条件采样（100步）:")
-    try:
-        samples_ddpm, _ = diffusion.sample(
-            model,
-            image_size=28,
-            batch_size=2,
-            channels=1,
-            sampler_type="ddpm",
-            cond=mask,
-            progress=False
-        )
-        print(f"✓ DDPM 生成样本形状: {samples_ddpm.shape}")
-    except Exception as e:
-        print(f"✗ DDPM 采样失败: {e}")
-
-    # 测试 DDIM 条件采样
-    print("\n测试 DDIM 条件采样（20步）:")
-    try:
-        samples_ddim, _ = diffusion.sample(
-            model,
-            image_size=28,
-            batch_size=2,
-            channels=1,
-            sampler_type="ddim",
-            ddim_steps=20,
-            eta=0.0,
-            cond=mask,
-            progress=False
-        )
-        print(f"✓ DDIM 生成样本形状: {samples_ddim.shape}")
-    except Exception as e:
-        print(f"✗ DDIM 采样失败: {e}")
-
-    print("\n" + "=" * 50)
-    print("测试完成！")
-    print("=" * 50)
-
-
-if __name__ == "__main__":
-    test_diffusion()
+        return x0_pred

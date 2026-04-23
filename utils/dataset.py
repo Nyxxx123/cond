@@ -212,22 +212,24 @@ class PulmonaryAngiographyDataset(Dataset):
     def __getitem__(self, idx):
         item = self.image_list[idx]
 
-        # 加载造影图像（目标）
+        # 加载造影图像
         angio_image = Image.open(item['image_path']).convert('L')
-        target_tensor = self.transform(angio_image)  # [1, H, W]
+        target_tensor = self.transform(angio_image)
 
-        # 加载掩码（根据类型）
+        # 加载掩码
         mask = self._load_mask(item['mask_path'])
 
-        # 解析角度信息（从文件名）
-        angle_info = get_angle_info(item['img_name'])
+        # 解析角度信息（使用四元数表示）
+        from config import Config
+        config = Config()
+        angle_info = get_angle_info(item['img_name'], angle_rep=config.angle_rep)
 
         return {
-            'target': target_tensor,                      # 目标造影图 [1, H, W]
-            'mask': mask,                                 # 条件掩码（2D或3D）
-            'angle_matrix': angle_info['rotation_matrix'], # 旋转矩阵 [9]
-            'angle_deg': angle_info['angle_deg'],         # 角度（度数）
-            'view_index': angle_info['view_index'],       # 视角序号
+            'target': target_tensor,
+            'mask': mask,
+            'angle': torch.from_numpy(angle_info['angle_vector']).float(),  # 四元数 [4]
+            'angle_deg': angle_info['angle_deg'],
+            'view_index': angle_info['view_index'],
             'patient': item['patient'],
             'img_name': item['img_name']
         }

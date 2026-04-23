@@ -1,26 +1,24 @@
 """
 条件扩散模型训练脚本 - 肺动脉造影版本
 使用血管掩码作为条件（支持2D MIP或3D原始掩码）
+添加LPIPS感知损失提升生成质量
 """
 
 import os
 import json
-import copy
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import lpips
 
 from config import Config
 from utils.noise_schedule import get_noise_schedule
 from utils.diffusion import GaussianDiffusion
 from utils.dataset import create_dataloader
 from models.cond_unet import ConditionalUNet
-
-# 只在需要时导入EMA
-if Config().use_ema:
-    from utils.ema import EMA
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -31,10 +29,12 @@ def prepare_data(shuffle=True):
     return dataloader
 
 
-def train_one_epoch(model, diffusion, dataloader, optimizer, config, epoch):
-    """训练一个epoch"""
+def train_one_epoch(model, diffusion, dataloader, optimizer, config, epoch, lpips_loss_fn):
+    """训练一个epoch（包含LPIPS损失）"""
     model.train()
     total_loss = 0
+    total_mse_loss = 0
+    total_lpips_loss = 0
     num_batches = len(dataloader)
     batch_losses = []
 
@@ -46,14 +46,41 @@ def train_one_epoch(model, diffusion, dataloader, optimizer, config, epoch):
         angles = batch['angle'].to(config.device)
         batch_size = targets.shape[0]
 
+        # 随机采样时间步
         t = torch.randint(0, config.timesteps, (batch_size,), device=config.device).long()
 
-        # 计算损失
-        loss = diffusion.p_losses(model, targets, t, mask=masks, angle=angles)
+        # 前向扩散：添加噪声
+        noise = torch.randn_like(targets)
+        x_noisy = diffusion.q_sample(targets, t, noise)
 
+        # 模型预测噪声
+        predicted_noise = model(x_noisy, masks, angles, t)
+
+        # ========== 损失计算 ==========
+        # 1. MSE损失（主要损失）
+        mse_loss = F.mse_loss(predicted_noise, noise)
+
+        # 2. LPIPS感知损失（可选）
+        if config.use_lpips:
+            # 从预测噪声还原x0_pred
+            x0_pred = diffusion.predict_x0_from_noise(x_noisy, predicted_noise, t)
+            # 计算感知损失
+            lpips_loss_val = lpips_loss_fn(x0_pred, targets).mean()
+            # 组合损失
+            loss = mse_loss + config.lpips_loss_weight * lpips_loss_val
+            total_lpips_loss += lpips_loss_val.item()
+        else:
+            loss = mse_loss
+            lpips_loss_val = torch.tensor(0.0)
+
+        total_mse_loss += mse_loss.item()
+        # ============================
+
+        # 反向传播
         optimizer.zero_grad()
         loss.backward()
 
+        # 梯度裁剪
         if config.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
@@ -62,12 +89,20 @@ def train_one_epoch(model, diffusion, dataloader, optimizer, config, epoch):
         total_loss += loss.item()
         avg_loss = total_loss / (batch_idx + 1)
         batch_losses.append(loss.item())
+
+        # 更新进度条
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
+            'mse': f'{mse_loss.item():.4f}',
+            'lpips': f'{lpips_loss_val.item():.4f}',
             'avg_loss': f'{avg_loss:.4f}'
         })
 
-    return total_loss / num_batches, batch_losses
+    avg_total_loss = total_loss / num_batches
+    avg_mse_loss = total_mse_loss / num_batches
+    avg_lpips_loss = total_lpips_loss / num_batches if config.use_lpips else 0
+
+    return avg_total_loss, avg_mse_loss, avg_lpips_loss, batch_losses
 
 
 def sample_and_save(model, diffusion, dataloader, config, epoch):
@@ -145,52 +180,50 @@ def sample_and_save(model, diffusion, dataloader, config, epoch):
             plt.close()
 
 
-def plot_loss_curves(train_losses, val_losses=None, save_dir="./"):
+def plot_loss_curves(train_losses, mse_losses=None, lpips_losses=None, save_dir="./"):
     """
     绘制损失曲线
-
-    Args:
-        train_losses: 每个epoch的训练损失列表
-        val_losses: 每个epoch的验证损失列表（可选）
-        save_dir: 保存目录
     """
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 6))
 
     epochs = range(1, len(train_losses) + 1)
-    plt.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
-
-    if val_losses:
-        plt.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
-
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Total Loss', linewidth=2)
+    if mse_losses:
+        plt.plot(epochs, mse_losses, 'r-', label='MSE Loss', linewidth=2)
+    if lpips_losses:
+        plt.plot(epochs, lpips_losses, 'g-', label='LPIPS Loss', linewidth=2)
     plt.xlabel('Epoch', fontsize=12)
     plt.ylabel('Loss', fontsize=12)
-    plt.title('Training Loss Curve', fontsize=14)
+    plt.title('Training Loss Curves', fontsize=14)
     plt.legend(fontsize=10)
     plt.grid(True, alpha=0.3)
 
     # 添加最佳损失标记
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, train_losses, 'b-', label='Total Loss', linewidth=2)
     best_epoch = np.argmin(train_losses) + 1
     best_loss = min(train_losses)
-    plt.plot(best_epoch, best_loss, 'go', markersize=10, label=f'Best: {best_loss:.6f}')
+    plt.plot(best_epoch, best_loss, 'go', markersize=10)
     plt.annotate(f'Best: {best_loss:.6f}',
                  xy=(best_epoch, best_loss),
                  xytext=(best_epoch + 2, best_loss),
                  fontsize=9)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Total Loss Curve', fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "loss_curve.png"), dpi=150)
     plt.close()
-
     print(f"Loss curve saved to {save_dir}/loss_curve.png")
 
 
 def save_loss_history(loss_history, save_dir="./"):
     """
     保存损失历史到JSON文件
-
-    Args:
-        loss_history: 包含训练损失的字典
-        save_dir: 保存目录
     """
     loss_path = os.path.join(save_dir, "loss_history.json")
     with open(loss_path, 'w') as f:
@@ -206,8 +239,7 @@ def main():
     print(f"Data directory: {config.data_dir}")
     print(f"Mask type: {config.mask_type}")
     print(f"Condition block type: {config.cond_block_type}")
-    if config.use_ema:
-        print(f"EMA enabled with decay: {config.ema_decay}")
+    print(f"LPIPS loss: {config.use_lpips}, weight: {config.lpips_loss_weight}")
 
     # 创建目录
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -257,6 +289,13 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params / 1e6:.2f}M")
 
+    # ========== 初始化LPIPS损失函数 ==========
+    lpips_loss_fn = None
+    if config.use_lpips:
+        lpips_loss_fn = lpips.LPIPS(net=config.lpips_net).to(config.device)
+        print(f"LPIPS initialized with net={config.lpips_net}")
+    # =====================================
+
     # 优化器
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -270,80 +309,54 @@ def main():
         T_max=config.num_epochs * len(train_dataloader)
     )
 
-    # ========== EMA相关变量 ==========
-    ema = None
-    ema_start_epoch = getattr(config, 'ema_start_epoch', 10)  # 默认10个epoch后启动EMA
-
-    if config.use_ema:
-        ema = EMA(model, decay=config.ema_decay, device=config.device)
-        print(f"EMA will start at epoch {ema_start_epoch}")
-    # ================================
-
     # 记录损失
     train_losses = []
+    mse_losses = []
+    lpips_losses = []
     best_loss = float('inf')
 
     # 训练循环
     print("Starting training...")
 
     for epoch in range(config.num_epochs):
-        avg_loss, batch_losses = train_one_epoch(
-            model, diffusion, train_dataloader, optimizer, config, epoch
+        avg_total_loss, avg_mse_loss, avg_lpips_loss, batch_losses = train_one_epoch(
+            model, diffusion, train_dataloader, optimizer, config, epoch, lpips_loss_fn
         )
         scheduler.step()
 
-        train_losses.append(avg_loss)
+        train_losses.append(avg_total_loss)
+        mse_losses.append(avg_mse_loss)
+        if config.use_lpips:
+            lpips_losses.append(avg_lpips_loss)
 
-        # ========== 更新EMA（仅在启用且达到启动epoch时） ==========
-        if config.use_ema and epoch >= ema_start_epoch:
-            ema.update(model)
-        # =======================================================
-
-        print(f"Epoch {epoch + 1}/{config.num_epochs} completed. Average loss: {avg_loss:.6f}")
+        print(f"Epoch {epoch + 1}/{config.num_epochs} completed.")
+        print(f"  Total Loss: {avg_total_loss:.6f}, MSE: {avg_mse_loss:.6f}, LPIPS: {avg_lpips_loss:.6f}")
 
         # 保存最佳模型
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if avg_total_loss < best_loss:
+            best_loss = avg_total_loss
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
+                'loss': avg_total_loss,
+                'mse_loss': avg_mse_loss,
+                'lpips_loss': avg_lpips_loss,
                 'config_dict': config.__dict__
             }, os.path.join(config.checkpoint_dir, "best_model.pt"))
-
-            # 如果启用EMA，也保存EMA模型
-            if config.use_ema and epoch >= ema_start_epoch:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': ema.shadow.state_dict(),
-                    'loss': avg_loss,
-                    'config_dict': config.__dict__
-                }, os.path.join(config.checkpoint_dir, "best_model_ema.pt"))
-
-            print(f"Saved best model with loss: {avg_loss:.6f}")
+            print(f"Saved best model with loss: {avg_total_loss:.6f}")
 
         # 定期采样
         if (epoch + 1) % config.sample_frequency == 0:
-            # ========== 采样逻辑：根据是否启用EMA选择模型 ==========
-            if config.use_ema and epoch >= ema_start_epoch:
-                # 保存当前模型权重
-                current_state_dict = copy.deepcopy(model.state_dict())
-                # 应用EMA权重
-                ema.apply_to(model)
-                # 采样
-                sample_and_save(model, diffusion, sample_dataloader, config, epoch)
-                # 恢复原始权重
-                model.load_state_dict(current_state_dict)
-            else:
-                # 不使用EMA，直接采样
-                sample_and_save(model, diffusion, sample_dataloader, config, epoch)
-            # =====================================================
+            print(f"\nGenerating samples...")
+            sample_and_save(model, diffusion, sample_dataloader, config, epoch)
 
             # 更新损失曲线
-            plot_loss_curves(train_losses, save_dir=config.sample_dir)
+            plot_loss_curves(train_losses, mse_losses, lpips_losses, save_dir=config.sample_dir)
             save_loss_history({
                 'train_losses': train_losses,
+                'mse_losses': mse_losses,
+                'lpips_losses': lpips_losses if config.use_lpips else [],
                 'best_loss': best_loss,
                 'best_epoch': train_losses.index(best_loss) + 1 if best_loss != float('inf') else 0,
                 'num_epochs': epoch + 1,
@@ -352,14 +365,17 @@ def main():
                     'batch_size': config.batch_size,
                     'cond_block_type': config.cond_block_type,
                     'mask_type': config.mask_type,
-                    'use_ema': config.use_ema
+                    'use_lpips': config.use_lpips,
+                    'lpips_loss_weight': config.lpips_loss_weight
                 }
             }, save_dir=config.checkpoint_dir)
 
     # 训练完成，绘制最终损失曲线
-    plot_loss_curves(train_losses, save_dir=config.sample_dir)
+    plot_loss_curves(train_losses, mse_losses, lpips_losses, save_dir=config.sample_dir)
     save_loss_history({
         'train_losses': train_losses,
+        'mse_losses': mse_losses,
+        'lpips_losses': lpips_losses if config.use_lpips else [],
         'best_loss': best_loss,
         'best_epoch': train_losses.index(best_loss) + 1,
         'num_epochs': config.num_epochs,
@@ -368,7 +384,8 @@ def main():
             'batch_size': config.batch_size,
             'cond_block_type': config.cond_block_type,
             'mask_type': config.mask_type,
-            'use_ema': config.use_ema
+            'use_lpips': config.use_lpips,
+            'lpips_loss_weight': config.lpips_loss_weight
         }
     }, save_dir=config.checkpoint_dir)
 
@@ -377,26 +394,18 @@ def main():
         'epoch': config.num_epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'loss': avg_loss,
+        'loss': avg_total_loss,
+        'mse_loss': avg_mse_loss,
+        'lpips_loss': avg_lpips_loss if config.use_lpips else 0,
         'config_dict': config.__dict__
     }, os.path.join(config.checkpoint_dir, "final_model.pt"))
 
-    # 如果启用EMA，保存最终EMA模型
-    if config.use_ema:
-        torch.save({
-            'epoch': config.num_epochs,
-            'model_state_dict': ema.shadow.state_dict(),
-            'loss': avg_loss,
-            'config_dict': config.__dict__
-        }, os.path.join(config.checkpoint_dir, "final_model_ema.pt"))
-
     print("Training completed!")
     print(f"Best loss: {best_loss:.6f} at epoch {train_losses.index(best_loss) + 1}")
-    if config.use_ema:
-        print(f"EMA models saved to {config.checkpoint_dir}/best_model_ema.pt")
     print(f"Loss curve saved to {config.sample_dir}/loss_curve.png")
 
 
 if __name__ == "__main__":
     import numpy as np
+
     main()

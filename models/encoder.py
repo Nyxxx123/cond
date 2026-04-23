@@ -72,31 +72,6 @@ class MaskEncoder2D(nn.Module):
         return features
 
 
-class SimpleMaskEncoder2D(nn.Module):
-    """
-    更轻量的2D掩码编码器
-    """
-
-    def __init__(self, in_channels=1, cond_dim=256):
-        super().__init__()
-
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, cond_dim),
-            nn.LayerNorm(cond_dim)
-        )
-
-    def forward(self, x):
-        return self.encoder(x)
-
-
 # ==================== 3D编码器 ====================
 
 class MaskEncoder3D(nn.Module):
@@ -111,7 +86,7 @@ class MaskEncoder3D(nn.Module):
 
         # 3D卷积层：逐步下采样
         self.conv_layers = nn.Sequential(
-            # Stage 1: 64->32 (假设输入64)
+            # Stage 1: 64->32
             nn.Conv3d(in_channels, 32, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
@@ -163,107 +138,22 @@ class MaskEncoder3D(nn.Module):
         return features
 
 
-class SimpleMaskEncoder3D(nn.Module):
-    """
-    更轻量的3D掩码编码器
-    """
-
-    def __init__(self, in_channels=1, cond_dim=256):
-        super().__init__()
-
-        self.encoder = nn.Sequential(
-            nn.Conv3d(in_channels, 32, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(32, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(128, 256, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool3d(1),
-            nn.Flatten(),
-            nn.Linear(256, cond_dim),
-            nn.LayerNorm(cond_dim)
-        )
-
-    def forward(self, x):
-        return self.encoder(x)
 
 
 # ==================== 多模态编码器（扩展用） ====================
 
-class MultiModalEncoder(nn.Module):
-    """
-    多模态编码器：支持多种条件融合
-    """
-
-    def __init__(self, cond_dim=256, use_2d_mask=False, use_3d_mask=True, use_angle=False):
-        super().__init__()
-
-        self.use_2d_mask = use_2d_mask
-        self.use_3d_mask = use_3d_mask
-        self.use_angle = use_angle
-
-        total_dim = 0
-
-        if use_2d_mask:
-            self.mask_2d_encoder = SimpleMaskEncoder2D(cond_dim=cond_dim)
-            total_dim += cond_dim
-
-        if use_3d_mask:
-            self.mask_3d_encoder = SimpleMaskEncoder3D(cond_dim=cond_dim)
-            total_dim += cond_dim
-
-        if use_angle:
-            self.angle_encoder = AngleEncoder(cond_dim=cond_dim)
-            total_dim += cond_dim
-
-        # 融合层
-        if total_dim > cond_dim:
-            self.fusion = nn.Sequential(
-                nn.Linear(total_dim, cond_dim * 2),
-                nn.ReLU(inplace=True),
-                nn.Linear(cond_dim * 2, cond_dim),
-                nn.LayerNorm(cond_dim)
-            )
-        else:
-            self.fusion = nn.Identity()
-
-        self.cond_dim = cond_dim
-
-    def forward(self, mask_2d=None, mask_3d=None, angle=None):
-        features = []
-
-        if self.use_2d_mask and mask_2d is not None:
-            features.append(self.mask_2d_encoder(mask_2d))
-
-        if self.use_3d_mask and mask_3d is not None:
-            features.append(self.mask_3d_encoder(mask_3d))
-
-        if self.use_angle and angle is not None:
-            features.append(self.angle_encoder(angle))
-
-        if len(features) == 0:
-            return torch.zeros(1, self.cond_dim)
-
-        if len(features) == 1:
-            return features[0]
-
-        concat = torch.cat(features, dim=1)
-        return self.fusion(concat)
-
-
 class AngleEncoder(nn.Module):
     """
-    角度编码器（参考您的另一个项目）
-    输入: [B, 9] 旋转矩阵
-    输出: [B, cond_dim]
+    角度编码器
+    输入: [B, angle_dim] 角度表示（四元数/旋转矩阵/欧拉角）
+    输出: [B, cond_dim] 角度特征向量
     """
 
-    def __init__(self, in_dim=9, cond_dim=256):
+    def __init__(self, angle_dim=4, cond_dim=256):
         super().__init__()
+
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, 128),
+            nn.Linear(angle_dim, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, 256),
             nn.ReLU(inplace=True),
@@ -271,62 +161,83 @@ class AngleEncoder(nn.Module):
             nn.LayerNorm(cond_dim)
         )
 
-    def forward(self, x):
-        return self.mlp(x)
+    def forward(self, angle):
+        """
+        Args:
+            angle: [B, angle_dim] 角度表示（四元数/旋转矩阵/欧拉角）
+        Returns:
+            angle_feat: [B, cond_dim] 角度特征
+        """
+        return self.mlp(angle)
 
 
-# ==================== 测试代码 ====================
-if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+class MultiConditionEncoder(nn.Module):
+    """
+    多条件编码器：融合掩码和角度信息
+    """
 
-    print("=" * 50)
-    print("测试编码器")
-    print("=" * 50)
+    def __init__(self,
+                 mask_type="3d",
+                 mask_cond_dim=256,
+                 angle_cond_dim=256,
+                 use_angle=True,
+                 angle_dim=4,
+                 fused_cond_dim=256):
+        super().__init__()
 
-    # 测试2D编码器
-    print("\n1. 测试2D编码器:")
-    mask_2d = torch.randn(4, 1, 256, 256).to(device)
-    encoder_2d = MaskEncoder2D(cond_dim=256).to(device)
-    encoder_2d_simple = SimpleMaskEncoder2D(cond_dim=256).to(device)
+        self.use_angle = use_angle
 
-    with torch.no_grad():
-        out1 = encoder_2d(mask_2d)
-        out2 = encoder_2d_simple(mask_2d)
+        # 掩码编码器
+        if mask_type == "2d":
+            self.mask_encoder = MaskEncoder2D(cond_dim=mask_cond_dim)
+        else:
+            self.mask_encoder = MaskEncoder3D(cond_dim=mask_cond_dim)
 
-    print(f"  MaskEncoder2D 输出: {out1.shape}")
-    print(f"  SimpleMaskEncoder2D 输出: {out2.shape}")
-    print(f"  参数量: {sum(p.numel() for p in encoder_2d.parameters()):,}")
+        # 角度编码器
+        if use_angle:
+            self.angle_encoder = AngleEncoder(angle_dim=angle_dim, cond_dim=angle_cond_dim)
 
-    # 测试3D编码器
-    print("\n2. 测试3D编码器:")
-    mask_3d = torch.randn(4, 1, 64, 64, 64).to(device)
-    encoder_3d = MaskEncoder3D(cond_dim=256).to(device)
-    encoder_3d_simple = SimpleMaskEncoder3D(cond_dim=256).to(device)
+        # 特征融合层
+        total_dim = mask_cond_dim
+        if use_angle:
+            total_dim += angle_cond_dim
 
-    with torch.no_grad():
-        out3 = encoder_3d(mask_3d)
-        out4 = encoder_3d_simple(mask_3d)
+        if total_dim > fused_cond_dim:
+            self.fusion = nn.Sequential(
+                nn.Linear(total_dim, fused_cond_dim * 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(fused_cond_dim * 2, fused_cond_dim),
+                nn.LayerNorm(fused_cond_dim)
+            )
+        else:
+            self.fusion = nn.Identity()
 
-    print(f"  MaskEncoder3D 输出: {out3.shape}")
-    print(f"  SimpleMaskEncoder3D 输出: {out4.shape}")
-    print(f"  参数量: {sum(p.numel() for p in encoder_3d.parameters()):,}")
+        self.fused_cond_dim = fused_cond_dim
 
-    # 测试多模态编码器
-    print("\n3. 测试多模态编码器:")
-    multi_encoder = MultiModalEncoder(
-        cond_dim=256,
-        use_2d_mask=True,
-        use_3d_mask=True,
-        use_angle=True
-    ).to(device)
+    def forward(self, mask, angle=None):
+        """
+        Args:
+            mask: [B, 1, D, H, W] 或 [B, 1, H, W]
+            angle: [B, angle_dim] 四元数/旋转矩阵/欧拉角，可选
 
-    angle = torch.randn(4, 9).to(device)
-    with torch.no_grad():
-        out5 = multi_encoder(mask_2d=mask_2d, mask_3d=mask_3d, angle=angle)
+        Returns:
+            cond: [B, fused_cond_dim] 融合后的条件向量
+        """
+        # 编码掩码
+        mask_feat = self.mask_encoder(mask)  # [B, mask_cond_dim]
+        features = [mask_feat]
 
-    print(f"  MultiModalEncoder 输出: {out5.shape}")
-    print(f"  参数量: {sum(p.numel() for p in multi_encoder.parameters()):,}")
+        # 编码角度
+        if self.use_angle and angle is not None:
+            angle_feat = self.angle_encoder(angle)  # [B, angle_cond_dim]
+            features.append(angle_feat)
 
-    print("\n" + "=" * 50)
-    print("测试完成！")
-    print("=" * 50)
+        # 融合
+        if len(features) == 1:
+            cond = features[0]
+        else:
+            concat = torch.cat(features, dim=1)
+            cond = self.fusion(concat)
+
+        return cond
+
