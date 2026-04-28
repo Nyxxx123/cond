@@ -9,19 +9,23 @@ class Config:
     # 设备设置
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # 预测类型: "epsilon" 或 "v"
+    prediction_type = "epsilon"  # 推荐使用 "v"，更稳定
+
     # EMA配置
     ema_decay = 0.9999  # 衰减率，推荐0.999-0.9999
     use_ema = False  # 是否使用EMA
 
     # LPIPS感知损失配置
-    use_lpips = True  # 是否使用LPIPS损失
+    use_lpips = True  # 开关：True=启用LPIPS
     lpips_loss_weight = 0.1  # LPIPS损失权重（建议0.05-0.5）
     lpips_net = "alex"  # 可选: "alex", "vgg"
 
     # GAN配置
-    use_gan = True  # 开关：True=启用GAN，False=纯LPIPS
+    use_gan = False  # 开关：True=启用GAN
     gan_loss_weight = 0.05  # GAN损失权重
-    disc_lr = 1e-4  # 判别器学习率
+    disc_lr = 5e-5  # 判别器学习率
+    gan_start_epoch = 100
 
     # 数据参数 - CT图像
     batch_size = 4
@@ -69,8 +73,8 @@ class Config:
 
     # 采样参数
     sample_batch_size = 16
-    sample_frequency = 5  # 每5个epoch采样一次
+    sample_frequency = 25  # 每5个epoch采样一次
 
     # 日志和保存
-    checkpoint_dir = "./checkpoints_ct_3d_angle_lpips&gan_ddim"
-    sample_dir = "./samples_ct_3d_angle_lpips&gan_ddim"
+    checkpoint_dir = "./checkpoints_ct_test"
+    sample_dir = "./samples_ct_3d_angle_test"

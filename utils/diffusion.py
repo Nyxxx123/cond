@@ -2,6 +2,7 @@
 扩散过程核心实现
 支持 DDPM 和 DDIM 两种采样方式
 支持条件生成
+支持 ε-prediction 和 v-prediction 两种预测类型
 """
 
 import torch
@@ -15,15 +16,18 @@ class GaussianDiffusion:
     高斯扩散过程
     支持 DDPM 和 DDIM 采样
     支持条件生成（传入 mask 条件）
+    支持 prediction_type: "epsilon" 或 "v"
     """
-    def __init__(self, betas, device):
+    def __init__(self, betas, device, prediction_type="epsilon"):
         """
         betas: 噪声调度序列
         device: 计算设备
+        prediction_type: "epsilon" 或 "v"
         """
         self.betas = betas.to(device)
         self.device = device
         self.timesteps = len(betas)
+        self.prediction_type = prediction_type
 
         # 计算相关参数
         alphas = 1.0 - betas
@@ -41,6 +45,11 @@ class GaussianDiffusion:
         self.alphas_cumprod_prev = alphas_cumprod_prev.to(device)
         self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod).to(device)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod).to(device)
+
+        # v-prediction 需要的角度参数: φ_t = arccos(√ᾱ_t)
+        # 则 cosφ_t = √ᾱ_t, sinφ_t = √(1-ᾱ_t)
+        self.cos_phi = self.sqrt_alphas_cumprod
+        self.sin_phi = self.sqrt_one_minus_alphas_cumprod
 
     def _extract(self, a, t, x_shape):
         """
@@ -70,20 +79,67 @@ class GaussianDiffusion:
 
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
+    def compute_target(self, x_start, t, noise):
+        """
+        根据 prediction_type 计算训练目标
+        """
+        if self.prediction_type == "epsilon":
+            return noise
+        elif self.prediction_type == "v":
+            sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+            sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+            v_target = sqrt_alphas_cumprod_t * noise - sqrt_one_minus_alphas_cumprod_t * x_start
+            return v_target
+        else:
+            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
+
+    def predict_x0_and_eps_from_v(self, x_t, v_pred, t):
+        """
+        从 v-prediction 恢复 x0_pred 和 eps_pred
+        """
+        cos_phi_t = self._extract(self.cos_phi, t, x_t.shape)
+        sin_phi_t = self._extract(self.sin_phi, t, x_t.shape)
+
+        x0_pred = cos_phi_t * x_t - sin_phi_t * v_pred
+        eps_pred = sin_phi_t * x_t + cos_phi_t * v_pred
+
+        return x0_pred, eps_pred
+
+    def predict_noise_from_x0(self, x_t, x0_pred, t):
+        """
+        从预测的 x0 恢复预测的噪声（用于 ε-prediction 模式）
+        """
+        sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_t.shape)
+        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+
+        eps_pred = (x_t - sqrt_alphas_cumprod_t * x0_pred) / sqrt_one_minus_alphas_cumprod_t
+        return eps_pred
+
     def p_losses(self, model, x_start, t, mask=None, angle=None, noise=None):
+        """
+        计算训练损失（支持 ε-prediction 和 v-prediction）
+        """
         if noise is None:
             noise = torch.randn_like(x_start)
 
         x_noisy = self.q_sample(x_start, t, noise)
 
-        # 传入多条件
-        predicted_noise = model(x_noisy, mask, angle=angle, t=t)
+        # 模型预测（输出与预测目标维度相同）
+        model_output = model(x_noisy, mask, angle=angle, t=t)
 
-        return F.mse_loss(predicted_noise, noise)
+        # 计算目标值
+        target = self.compute_target(x_start, t, noise)
 
-    # 修改 p_sample 方法
+        # 计算损失
+        loss = F.mse_loss(model_output, target)
+
+        return loss
+
     @torch.no_grad()
     def p_sample(self, model, x, t, t_index, mask=None, angle=None):
+        """
+        单步逆向采样（支持 ε-prediction 和 v-prediction）
+        """
         t = t.long().to(self.device)
 
         betas_t = self._extract(self.betas, t, x.shape)
@@ -92,11 +148,26 @@ class GaussianDiffusion:
         )
         sqrt_recip_alphas_t = 1.0 / torch.sqrt(self._extract(self.alphas, t, x.shape))
 
-        predicted_noise = model(x, mask, angle=angle, t=t)
+        # 模型预测
+        model_output = model(x, mask, angle=angle, t=t)
 
-        model_mean = sqrt_recip_alphas_t * (
+        if self.prediction_type == "epsilon":
+            predicted_noise = model_output
+            model_mean = sqrt_recip_alphas_t * (
                 x - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t
-        )
+            )
+        else:  # v-prediction
+            # 从 v 恢复 x0_pred 和 eps_pred
+            cos_phi_t = self._extract(self.cos_phi, t, x.shape)
+            sin_phi_t = self._extract(self.sin_phi, t, x.shape)
+
+            x0_pred = cos_phi_t * x - sin_phi_t * model_output
+            eps_pred = sin_phi_t * x + cos_phi_t * model_output
+
+            # 使用与 ε-prediction 相同的更新公式
+            model_mean = sqrt_recip_alphas_t * (
+                x - betas_t * eps_pred / sqrt_one_minus_alphas_cumprod_t
+            )
 
         if t_index == 0:
             return model_mean
@@ -109,16 +180,7 @@ class GaussianDiffusion:
     def sample_ddpm(self, model, image_size, batch_size=16, channels=1,
                     mask=None, angle=None, progress=True):
         """
-        完整DDPM采样循环（支持条件）
-
-        Args:
-            model: 条件UNet
-            image_size: 图像尺寸
-            batch_size: 批次大小
-            channels: 通道数
-            mask: 掩码条件（2D或3D）
-            angle: 角度条件（四元数）
-            progress: 是否显示进度条
+        完整DDPM采样循环
         """
         shape = (batch_size, channels, image_size, image_size)
         img = torch.randn(shape, device=self.device)
@@ -141,7 +203,6 @@ class GaussianDiffusion:
 
         for i in indices:
             t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-            # 修改这里：传入 mask 和 angle，不再用 cond
             img = self.p_sample(model, img, t, i, mask=mask, angle=angle)
 
             if i % 100 == 0 or i == self.timesteps - 1 or i == 0:
@@ -152,7 +213,7 @@ class GaussianDiffusion:
     @torch.no_grad()
     def sample_timestep_ddim(self, model, x, t, mask=None, angle=None, eta=0.0):
         """
-        DDIM 单步采样
+        DDIM 单步采样（支持 ε-prediction 和 v-prediction）
         """
         alpha_cumprod_t = self._extract(self.alphas_cumprod, t, x.shape)
         alpha_cumprod_t_prev = self._extract(self.alphas_cumprod_prev, t, x.shape)
@@ -161,10 +222,18 @@ class GaussianDiffusion:
         sqrt_alpha_cumprod_t_prev = torch.sqrt(alpha_cumprod_t_prev)
         sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alpha_cumprod_t)
 
-        # 预测噪声（传入mask和angle）
-        eps_theta = model(x, mask, angle=angle, t=t)
+        # 模型预测
+        model_output = model(x, mask, angle=angle, t=t)
 
-        x0_pred = (x - sqrt_one_minus_alpha_cumprod_t * eps_theta) / sqrt_alpha_cumprod_t
+        if self.prediction_type == "epsilon":
+            eps_theta = model_output
+            x0_pred = (x - sqrt_one_minus_alpha_cumprod_t * eps_theta) / sqrt_alpha_cumprod_t
+        else:  # v-prediction
+            cos_phi_t = self._extract(self.cos_phi, t, x.shape)
+            sin_phi_t = self._extract(self.sin_phi, t, x.shape)
+            x0_pred = cos_phi_t * x - sin_phi_t * model_output
+            eps_theta = sin_phi_t * x + cos_phi_t * model_output
+
         x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
 
         sigma = eta * torch.sqrt(
@@ -182,7 +251,7 @@ class GaussianDiffusion:
     def sample_ddim(self, model, image_size, batch_size=16, channels=1,
                     ddim_steps=50, eta=0.0, mask=None, angle=None, progress=True):
         """
-        DDIM 快速采样（支持条件）
+        DDIM 快速采样
         """
         shape = (batch_size, channels, image_size, image_size)
         img = torch.randn(shape, device=self.device)
@@ -235,23 +304,24 @@ class GaussianDiffusion:
         else:
             raise ValueError(f"Unknown sampler type: {sampler_type}")
 
-    # 添加lpips
     def predict_x0_from_noise(self, x_t, noise_pred, t):
         """
-        从噪声图像和预测的噪声还原x0
-
-        Args:
-            x_t: 噪声图像 [B, C, H, W]
-            noise_pred: 预测的噪声 [B, C, H, W]
-            t: 时间步 [B]
-
-        Returns:
-            x0_pred: 预测的干净图像 [B, C, H, W]
+        从噪声图像和预测的噪声还原x0（用于 ε-prediction 模式）
         """
         sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_t.shape)
         sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
 
         x0_pred = (x_t - sqrt_one_minus_alphas_cumprod_t * noise_pred) / sqrt_alphas_cumprod_t
-        x0_pred = torch.clamp(x0_pred, -1.0, 1.0)  # 限制范围
+        x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
 
+        return x0_pred
+
+    def predict_x0_from_v(self, x_t, v_pred, t):
+        """
+        从速度预测还原x0（用于 v-prediction 模式）
+        注意：此方法用于训练时计算 LPIPS，不需要 clamp
+        """
+        cos_phi_t = self._extract(self.cos_phi, t, x_t.shape)
+        sin_phi_t = self._extract(self.sin_phi, t, x_t.shape)
+        x0_pred = cos_phi_t * x_t - sin_phi_t * v_pred
         return x0_pred

@@ -144,7 +144,7 @@ def save_loss_history(loss_history, save_dir="./"):
 
 def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lpips_loss_fn,
                     discriminator=None, optimizer_D=None):
-    """训练一个epoch - 修复版"""
+    """训练一个epoch - 支持GAN推迟启动"""
     model.train()
     if discriminator is not None:
         discriminator.train()
@@ -156,7 +156,8 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
     total_loss_D = 0
     num_batches = len(dataloader)
 
-    use_gan = (discriminator is not None)
+    # ========== 判断是否启用GAN（推迟启动） ==========
+    use_gan = (discriminator is not None and epoch >= config.gan_start_epoch)
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{config.num_epochs}")
     for batch_idx, batch in enumerate(pbar):
@@ -170,12 +171,39 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
         x_noisy = diffusion.q_sample(targets, t, noise)
 
         # ========== 生成器前向 ==========
-        predicted_noise = model(x_noisy, masks, angles, t)
-        mse_loss = F.mse_loss(predicted_noise, noise)
-        x0_pred = diffusion.predict_x0_from_noise(x_noisy, predicted_noise, t)
-        lpips_loss_val = lpips_loss_fn(x0_pred, targets).mean()
+        model_output = model(x_noisy, masks, angles, t)   # 修改点1：变量名改为 model_output，避免歧义
 
-        loss_G = mse_loss + config.lpips_loss_weight * lpips_loss_val
+        # ========== 修正：根据 prediction_type 计算正确的 target ==========
+        if config.prediction_type == "epsilon":
+            target = noise
+        else:  # v-prediction
+            # 计算 v_target
+            sqrt_alphas_cumprod_t = diffusion._extract(diffusion.sqrt_alphas_cumprod, t, targets.shape)
+            sqrt_one_minus_alphas_cumprod_t = diffusion._extract(diffusion.sqrt_one_minus_alphas_cumprod, t, targets.shape)
+            target = sqrt_alphas_cumprod_t * noise - sqrt_one_minus_alphas_cumprod_t * targets
+
+        # 计算 MSE 损失
+        mse_loss = F.mse_loss(model_output, target)       # 修改点2：使用正确的 target
+        # ==================================================
+
+        # ========== 计算 x0_pred ==========
+        if config.prediction_type == "epsilon":
+            x0_pred = diffusion.predict_x0_from_noise(x_noisy, model_output, t)
+        else:  # v-prediction
+            x0_pred = diffusion.predict_x0_from_v(x_noisy, model_output, t)
+            x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+
+        # ========== LPIPS损失 ==========
+        if config.use_lpips:
+            lpips_loss_val = lpips_loss_fn(x0_pred, targets).mean()
+            total_lpips_loss += lpips_loss_val.item()
+        else:
+            lpips_loss_val = torch.tensor(0.0, device=config.device)
+
+        # ========== 生成器总损失 ==========
+        loss_G = mse_loss
+        if config.use_lpips:
+            loss_G = loss_G + config.lpips_loss_weight * lpips_loss_val
 
         if use_gan:
             fake_pred = discriminator(x0_pred)
@@ -193,9 +221,11 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
         # ========== 判别器前向（独立） ==========
         if use_gan:
             with torch.no_grad():
-                # 重新前向传播（不保留梯度）
-                predicted_noise_disc = model(x_noisy, masks, angles, t)
-                x0_pred_disc = diffusion.predict_x0_from_noise(x_noisy, predicted_noise_disc, t)
+                model_output_disc = model(x_noisy, masks, angles, t)
+                if config.prediction_type == "epsilon":
+                    x0_pred_disc = diffusion.predict_x0_from_noise(x_noisy, model_output_disc, t)
+                else:
+                    x0_pred_disc = diffusion.predict_x0_from_v(x_noisy, model_output_disc, t)
 
             real_pred = discriminator(targets)
             fake_pred = discriminator(x0_pred_disc)
@@ -214,11 +244,11 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
 
         total_loss_G += loss_G.item()
         total_mse_loss += mse_loss.item()
-        total_lpips_loss += lpips_loss_val.item()
 
         avg_loss = total_loss_G / (batch_idx + 1)
-        postfix = {'loss': f'{loss_G.item():.4f}', 'mse': f'{mse_loss.item():.4f}',
-                   'lpips': f'{lpips_loss_val.item():.4f}', 'avg': f'{avg_loss:.4f}'}
+        postfix = {'loss': f'{loss_G.item():.4f}', 'mse': f'{mse_loss.item():.4f}', 'avg': f'{avg_loss:.4f}'}
+        if config.use_lpips:
+            postfix['lpips'] = f'{lpips_loss_val.item():.4f}'
         if use_gan:
             postfix['gan'] = f'{gen_loss.item():.4f}'
             postfix['disc'] = f'{disc_loss.item():.4f}'
@@ -226,11 +256,12 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
 
     avg_loss_G = total_loss_G / num_batches
     avg_mse = total_mse_loss / num_batches
-    avg_lpips = total_lpips_loss / num_batches
+    avg_lpips = total_lpips_loss / num_batches if config.use_lpips else 0
     avg_gan = total_gan_loss / num_batches if use_gan else 0
     avg_loss_D = total_loss_D / num_batches if use_gan else 0
 
     return avg_loss_G, avg_mse, avg_lpips, avg_gan, avg_loss_D
+
 
 def main():
     config = Config()
@@ -264,7 +295,7 @@ def main():
     # 噪声调度
     print("Creating noise schedule...")
     betas = get_noise_schedule(config)
-    diffusion = GaussianDiffusion(betas, config.device)
+    diffusion = GaussianDiffusion(betas, config.device, prediction_type=config.prediction_type)
 
     # 创建生成器
     print("Creating generator (UNet)...")
