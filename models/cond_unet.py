@@ -1,6 +1,7 @@
 """
 条件U-Net
 接收噪声图像和血管掩码条件，生成肺动脉造影图像
+支持掩码 + 角度 + 无造影CT多条件
 """
 
 import torch
@@ -8,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from models.encoder import MaskEncoder2D, MaskEncoder3D, MultiConditionEncoder  # 修改：从encoder导入
+from models.encoder import MaskEncoder2D, MaskEncoder3D, MultiConditionEncoder
 from models.cond_attention import ConditionedBlock, AddConditionBlock
 
 
@@ -30,7 +31,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 class ConditionalUNet(nn.Module):
     """
-    条件U-Net（支持掩码+角度多条件）
+    条件U-Net（支持掩码+角度+无造影CT多条件）
     """
 
     def __init__(self,
@@ -42,11 +43,13 @@ class ConditionalUNet(nn.Module):
                  block_type="cross_attention",
                  mask_type="3d",
                  use_angle=True,
-                 angle_dim=4):
+                 angle_dim=4,
+                 use_non_angio=False):          # 新增参数
         super().__init__()
 
         self.base_channels = base_channels
         self.cond_dim = cond_dim
+        self.use_non_angio = use_non_angio
 
         # 选择条件块类型
         if block_type == "add":
@@ -54,13 +57,15 @@ class ConditionalUNet(nn.Module):
         else:
             BlockClass = ConditionedBlock
 
-        # 多条件编码器（融合掩码和角度）
+        # 多条件编码器（融合掩码、角度、无造影CT）
         self.cond_encoder = MultiConditionEncoder(
             mask_type=mask_type,
             mask_cond_dim=cond_dim,
             angle_cond_dim=cond_dim,
             use_angle=use_angle,
             angle_dim=angle_dim,
+            use_non_angio=use_non_angio,
+            non_angio_cond_dim=cond_dim,
             fused_cond_dim=cond_dim
         )
 
@@ -106,23 +111,24 @@ class ConditionalUNet(nn.Module):
             tensor = F.interpolate(tensor, size=target_size, mode='bilinear', align_corners=False)
         return tensor
 
-    def forward(self, x, mask, angle=None, t=None):
+    def forward(self, x, mask, angle=None, non_angio=None, t=None):
         """
         Args:
             x: 噪声图像 [B, 1, H, W]
             mask: 血管掩码（2D或3D）
-            angle: 角度表示 [B, angle_dim]（四元数/旋转矩阵）
+            angle: 角度表示 [B, angle_dim]（可选）
+            non_angio: 无造影CT图像 [B, 1, H, W]（可选）
             t: 时间步 [B]
         """
         original_size = x.shape[-2:]
 
-        # 多条件编码（融合掩码和角度）
-        cond = self.cond_encoder(mask, angle)  # [B, cond_dim]
+        # 多条件编码
+        cond = self.cond_encoder(mask, angle, non_angio)  # [B, cond_dim]
 
         # 时间嵌入
         t_emb = self.time_mlp(t)
 
-        # U-Net前向传播（与之前相同）
+        # U-Net前向传播
         h = self.init_conv(x)
 
         e1 = self.enc1(h, t_emb, cond)

@@ -138,8 +138,6 @@ class MaskEncoder3D(nn.Module):
         return features
 
 
-
-
 # ==================== 多模态编码器（扩展用） ====================
 
 class AngleEncoder(nn.Module):
@@ -171,9 +169,36 @@ class AngleEncoder(nn.Module):
         return self.mlp(angle)
 
 
+# ==================== 新增：无造影CT编码器 ====================
+class XRayEncoder(nn.Module):
+    """
+    2D 无造影CT图像编码器
+    输入: [B, 1, H, W]
+    输出: [B, cond_dim] 条件向量
+    """
+    def __init__(self, in_channels=1, cond_dim=256):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(256, cond_dim),
+            nn.LayerNorm(cond_dim)
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
 class MultiConditionEncoder(nn.Module):
     """
     多条件编码器：融合掩码和角度信息
+    （扩展支持无造影CT）
     """
 
     def __init__(self,
@@ -182,10 +207,13 @@ class MultiConditionEncoder(nn.Module):
                  angle_cond_dim=256,
                  use_angle=True,
                  angle_dim=4,
+                 use_non_angio=False,           # 新增参数
+                 non_angio_cond_dim=256,        # 新增参数
                  fused_cond_dim=256):
         super().__init__()
 
         self.use_angle = use_angle
+        self.use_non_angio = use_non_angio      # 新增
 
         # 掩码编码器
         if mask_type == "2d":
@@ -197,10 +225,16 @@ class MultiConditionEncoder(nn.Module):
         if use_angle:
             self.angle_encoder = AngleEncoder(angle_dim=angle_dim, cond_dim=angle_cond_dim)
 
+        # 新增：无造影CT编码器
+        if use_non_angio:
+            self.non_angio_encoder = XRayEncoder(in_channels=1, cond_dim=non_angio_cond_dim)
+
         # 特征融合层
         total_dim = mask_cond_dim
         if use_angle:
             total_dim += angle_cond_dim
+        if use_non_angio:                     # 新增
+            total_dim += non_angio_cond_dim
 
         if total_dim > fused_cond_dim:
             self.fusion = nn.Sequential(
@@ -214,11 +248,12 @@ class MultiConditionEncoder(nn.Module):
 
         self.fused_cond_dim = fused_cond_dim
 
-    def forward(self, mask, angle=None):
+    def forward(self, mask, angle=None, non_angio=None):   # 新增 non_angio 参数
         """
         Args:
             mask: [B, 1, D, H, W] 或 [B, 1, H, W]
             angle: [B, angle_dim] 四元数/旋转矩阵/欧拉角，可选
+            non_angio: [B, 1, H, W] 无造影CT图像，可选
 
         Returns:
             cond: [B, fused_cond_dim] 融合后的条件向量
@@ -232,6 +267,11 @@ class MultiConditionEncoder(nn.Module):
             angle_feat = self.angle_encoder(angle)  # [B, angle_cond_dim]
             features.append(angle_feat)
 
+        # 新增：编码无造影CT
+        if self.use_non_angio and non_angio is not None:
+            non_angio_feat = self.non_angio_encoder(non_angio)  # [B, non_angio_cond_dim]
+            features.append(non_angio_feat)
+
         # 融合
         if len(features) == 1:
             cond = features[0]
@@ -240,4 +280,3 @@ class MultiConditionEncoder(nn.Module):
             cond = self.fusion(concat)
 
         return cond
-

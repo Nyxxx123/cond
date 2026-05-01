@@ -40,12 +40,19 @@ def sample_and_save(model, diffusion, dataloader, config, epoch):
         test_masks = batch['mask'][:config.sample_batch_size].to(config.device)
         test_angles = batch['angle'][:config.sample_batch_size].to(config.device)
         test_targets = batch['target'][:config.sample_batch_size]
+        # ========== 新增：获取无造影CT条件 ==========
+        if config.use_non_angio:
+            test_non_angio = batch['non_angio'][:config.sample_batch_size].to(config.device)
+        else:
+            test_non_angio = None
+        # ========================================
         break
 
     actual_batch_size = test_masks.shape[0]
     num_samples = actual_batch_size
 
     with torch.no_grad():
+        # ========== 修改：传递 non_angio 参数 ==========
         samples, intermediates = diffusion.sample(
             model,
             config.image_size,
@@ -56,8 +63,10 @@ def sample_and_save(model, diffusion, dataloader, config, epoch):
             eta=config.ddim_eta,
             mask=test_masks,
             angle=test_angles,
+            non_angio=test_non_angio,   # 新增
             progress=True
         )
+        # ============================================
 
         samples = (samples + 1) / 2
         samples = torch.clamp(samples, 0, 1)
@@ -164,26 +173,32 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
         targets = batch['target'].to(config.device)
         masks = batch['mask'].to(config.device)
         angles = batch['angle'].to(config.device)
+        # ========== 新增：获取无造影CT条件 ==========
+        if config.use_non_angio:
+            non_angio = batch['non_angio'].to(config.device)
+        else:
+            non_angio = None
+        # ========================================
         batch_size = targets.shape[0]
 
         t = torch.randint(0, config.timesteps, (batch_size,), device=config.device).long()
         noise = torch.randn_like(targets)
         x_noisy = diffusion.q_sample(targets, t, noise)
 
-        # ========== 生成器前向 ==========
-        model_output = model(x_noisy, masks, angles, t)   # 修改点1：变量名改为 model_output，避免歧义
+        # ========== 生成器前向（传递 non_angio） ==========
+        model_output = model(x_noisy, masks, angles, non_angio=non_angio, t=t)
+        # =============================================
 
-        # ========== 修正：根据 prediction_type 计算正确的 target ==========
+        # ========== 根据 prediction_type 计算正确的 target ==========
         if config.prediction_type == "epsilon":
             target = noise
         else:  # v-prediction
-            # 计算 v_target
             sqrt_alphas_cumprod_t = diffusion._extract(diffusion.sqrt_alphas_cumprod, t, targets.shape)
             sqrt_one_minus_alphas_cumprod_t = diffusion._extract(diffusion.sqrt_one_minus_alphas_cumprod, t, targets.shape)
             target = sqrt_alphas_cumprod_t * noise - sqrt_one_minus_alphas_cumprod_t * targets
 
         # 计算 MSE 损失
-        mse_loss = F.mse_loss(model_output, target)       # 修改点2：使用正确的 target
+        mse_loss = F.mse_loss(model_output, target)
         # ==================================================
 
         # ========== 计算 x0_pred ==========
@@ -221,11 +236,13 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
         # ========== 判别器前向（独立） ==========
         if use_gan:
             with torch.no_grad():
-                model_output_disc = model(x_noisy, masks, angles, t)
+                # 重新前向传播（传递 non_angio）
+                model_output_disc = model(x_noisy, masks, angles, non_angio=non_angio, t=t)
                 if config.prediction_type == "epsilon":
                     x0_pred_disc = diffusion.predict_x0_from_noise(x_noisy, model_output_disc, t)
                 else:
                     x0_pred_disc = diffusion.predict_x0_from_v(x_noisy, model_output_disc, t)
+                    x0_pred_disc = torch.clamp(x0_pred_disc, -1.0, 1.0)
 
             real_pred = discriminator(targets)
             fake_pred = discriminator(x0_pred_disc)
@@ -241,6 +258,7 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
             if config.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip)
             optimizer_D.step()
+        # =================================
 
         total_loss_G += loss_G.item()
         total_mse_loss += mse_loss.item()
@@ -308,7 +326,8 @@ def main():
         block_type=config.cond_block_type,
         mask_type=config.mask_type,
         use_angle=config.use_angle_condition,
-        angle_dim=config.angle_dim
+        angle_dim=config.angle_dim,
+        use_non_angio=config.use_non_angio        # 新增参数
     ).to(config.device)
 
     num_params = sum(p.numel() for p in model.parameters())

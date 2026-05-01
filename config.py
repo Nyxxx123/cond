@@ -10,7 +10,7 @@ class Config:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 预测类型: "epsilon" 或 "v"
-    prediction_type = "epsilon"  # 推荐使用 "v"，更稳定
+    prediction_type = "v"  # 推荐使用 "v"，更稳定
 
     # EMA配置
     ema_decay = 0.9999  # 衰减率，推荐0.999-0.9999
@@ -33,6 +33,10 @@ class Config:
     channels = 1  # 灰度图
     data_dir = "./PARSE"  # CT图像目录（支持子文件夹结构）
     mip_cache_dir = "mask2D"  # MIP缓存目录名（相对于data_dir）
+
+    # ========== 新增：无造影CT条件配置 ==========
+    use_non_angio = True          # 是否使用无造影CT图作为条件
+    # =======================================
 
     # 采样参数（新增 DDIM 配置）
     sampler_type = "ddpm"      # "ddpm" 或 "ddim"
@@ -76,5 +80,5 @@ class Config:
     sample_frequency = 25  # 每5个epoch采样一次
 
     # 日志和保存
-    checkpoint_dir = "./checkpoints_ct_test"
-    sample_dir = "./samples_ct_3d_angle_test"
+    checkpoint_dir = "./checkpoints_ct_all_infor_mutiangle-v"
+    sample_dir = "./samples_ct_all_infor_mutiangle-v"

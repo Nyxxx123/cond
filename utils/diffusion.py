@@ -115,7 +115,7 @@ class GaussianDiffusion:
         eps_pred = (x_t - sqrt_alphas_cumprod_t * x0_pred) / sqrt_one_minus_alphas_cumprod_t
         return eps_pred
 
-    def p_losses(self, model, x_start, t, mask=None, angle=None, noise=None):
+    def p_losses(self, model, x_start, t, mask=None, angle=None, non_angio=None, noise=None):
         """
         计算训练损失（支持 ε-prediction 和 v-prediction）
         """
@@ -125,7 +125,9 @@ class GaussianDiffusion:
         x_noisy = self.q_sample(x_start, t, noise)
 
         # 模型预测（输出与预测目标维度相同）
-        model_output = model(x_noisy, mask, angle=angle, t=t)
+        # ========== 新增 non_angio 参数 ==========
+        model_output = model(x_noisy, mask, angle=angle, non_angio=non_angio, t=t)
+        # ======================================
 
         # 计算目标值
         target = self.compute_target(x_start, t, noise)
@@ -136,7 +138,7 @@ class GaussianDiffusion:
         return loss
 
     @torch.no_grad()
-    def p_sample(self, model, x, t, t_index, mask=None, angle=None):
+    def p_sample(self, model, x, t, t_index, mask=None, angle=None, non_angio=None):
         """
         单步逆向采样（支持 ε-prediction 和 v-prediction）
         """
@@ -149,7 +151,9 @@ class GaussianDiffusion:
         sqrt_recip_alphas_t = 1.0 / torch.sqrt(self._extract(self.alphas, t, x.shape))
 
         # 模型预测
-        model_output = model(x, mask, angle=angle, t=t)
+        # ========== 新增 non_angio 参数 ==========
+        model_output = model(x, mask, angle=angle, non_angio=non_angio, t=t)
+        # ======================================
 
         if self.prediction_type == "epsilon":
             predicted_noise = model_output
@@ -178,7 +182,7 @@ class GaussianDiffusion:
 
     @torch.no_grad()
     def sample_ddpm(self, model, image_size, batch_size=16, channels=1,
-                    mask=None, angle=None, progress=True):
+                    mask=None, angle=None, non_angio=None, progress=True):
         """
         完整DDPM采样循环
         """
@@ -195,6 +199,11 @@ class GaussianDiffusion:
         if angle is not None and angle.shape[0] != batch_size:
             angle = angle.repeat(batch_size, 1)
 
+        # ========== 新增 non_angio 的复制 ==========
+        if non_angio is not None and non_angio.shape[0] != batch_size:
+            non_angio = non_angio.repeat(batch_size, 1, 1, 1)
+        # ========================================
+
         intermediates = []
         indices = list(range(self.timesteps))[::-1]
 
@@ -203,7 +212,9 @@ class GaussianDiffusion:
 
         for i in indices:
             t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-            img = self.p_sample(model, img, t, i, mask=mask, angle=angle)
+            # ========== 新增 non_angio 参数 ==========
+            img = self.p_sample(model, img, t, i, mask=mask, angle=angle, non_angio=non_angio)
+            # ======================================
 
             if i % 100 == 0 or i == self.timesteps - 1 or i == 0:
                 intermediates.append(img.cpu())
@@ -211,7 +222,7 @@ class GaussianDiffusion:
         return img, intermediates
 
     @torch.no_grad()
-    def sample_timestep_ddim(self, model, x, t, mask=None, angle=None, eta=0.0):
+    def sample_timestep_ddim(self, model, x, t, mask=None, angle=None, non_angio=None, eta=0.0):
         """
         DDIM 单步采样（支持 ε-prediction 和 v-prediction）
         """
@@ -223,7 +234,9 @@ class GaussianDiffusion:
         sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alpha_cumprod_t)
 
         # 模型预测
-        model_output = model(x, mask, angle=angle, t=t)
+        # ========== 新增 non_angio 参数 ==========
+        model_output = model(x, mask, angle=angle, non_angio=non_angio, t=t)
+        # ======================================
 
         if self.prediction_type == "epsilon":
             eps_theta = model_output
@@ -249,7 +262,7 @@ class GaussianDiffusion:
 
     @torch.no_grad()
     def sample_ddim(self, model, image_size, batch_size=16, channels=1,
-                    ddim_steps=50, eta=0.0, mask=None, angle=None, progress=True):
+                    ddim_steps=50, eta=0.0, mask=None, angle=None, non_angio=None, progress=True):
         """
         DDIM 快速采样
         """
@@ -266,6 +279,11 @@ class GaussianDiffusion:
         if angle is not None and angle.shape[0] != batch_size:
             angle = angle.repeat(batch_size, 1)
 
+        # ========== 新增 non_angio 的复制 ==========
+        if non_angio is not None and non_angio.shape[0] != batch_size:
+            non_angio = non_angio.repeat(batch_size, 1, 1, 1)
+        # ========================================
+
         intermediates = []
         ddim_timesteps = np.linspace(0, self.timesteps - 1, ddim_steps, dtype=int)[::-1]
 
@@ -274,7 +292,9 @@ class GaussianDiffusion:
 
         for i, step in enumerate(ddim_timesteps):
             t = torch.full((batch_size,), step, device=self.device, dtype=torch.long)
-            img = self.sample_timestep_ddim(model, img, t, mask=mask, angle=angle, eta=eta)
+            # ========== 新增 non_angio 参数 ==========
+            img = self.sample_timestep_ddim(model, img, t, mask=mask, angle=angle, non_angio=non_angio, eta=eta)
+            # ======================================
             img = torch.clamp(img, -1.0, 1.0)
 
             if i % max(1, len(ddim_timesteps) // 10) == 0 or i == len(ddim_timesteps) - 1:
@@ -291,16 +311,16 @@ class GaussianDiffusion:
     @torch.no_grad()
     def sample(self, model, image_size, batch_size=16, channels=1,
                sampler_type="ddpm", ddim_steps=50, eta=0.0,
-               mask=None, angle=None, progress=True):
+               mask=None, angle=None, non_angio=None, progress=True):
         """
         统一的采样接口
         """
         if sampler_type == "ddpm":
             return self.sample_ddpm(model, image_size, batch_size, channels,
-                                    mask=mask, angle=angle, progress=progress)
+                                    mask=mask, angle=angle, non_angio=non_angio, progress=progress)
         elif sampler_type == "ddim":
             return self.sample_ddim(model, image_size, batch_size, channels,
-                                    ddim_steps, eta, mask=mask, angle=angle, progress=progress)
+                                    ddim_steps, eta, mask=mask, angle=angle, non_angio=non_angio, progress=progress)
         else:
             raise ValueError(f"Unknown sampler type: {sampler_type}")
 
