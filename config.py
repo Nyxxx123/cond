@@ -80,5 +80,5 @@ class Config:
     sample_frequency = 25  # 每5个epoch采样一次
 
     # 日志和保存
-    checkpoint_dir = "./checkpoints_ct_all_infor_mutiangle-v"
-    sample_dir = "./samples_ct_all_infor_mutiangle-v"
+    checkpoint_dir = "./checkpoints_ct_all_infor-v"
+    sample_dir = "./samples_ct_all_infor-v"

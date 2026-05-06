@@ -1,47 +1,55 @@
 """
-条件采样脚本：使用给定的血管掩码生成肺动脉造影图像
-支持2D MIP掩码和3D原始掩码
-直接运行或修改下方配置参数即可
+条件采样脚本 - 自动批量处理 TEST 文件夹
+TEST 文件夹结构：
+    TEST/
+    ├── mask/                    # 3D 掩码 (.nii.gz)
+    │   ├── patient001.nii.gz
+    │   └── patient002.nii.gz
+    ├── angiographs/             # 真实有造影图像（用于对比）
+    │   ├── patient001/
+    │   │   ├── patient001_0_mask.png
+    │   │   └── patient001_1_mask.png
+    │   └── patient002/
+    │       ├── patient002_0_mask.png
+    │       └── ...
+    └── non_angiographs/         # 无造影CT（可选）
+        ├── patient001/
+        │   ├── patient001_0_mask.png
+        │   └── patient001_1_mask.png
+        └── patient002/
+            ├── patient002_0_mask.png
+            └── ...
 """
 
 import os
-import numpy as np
 import torch
+import numpy as np
 from torchvision.utils import save_image
 import matplotlib.pyplot as plt
-import platform
+import nibabel as nib
+from PIL import Image
+import torchvision.transforms as transforms
+from tqdm import tqdm
 
 from config import Config
 from utils.noise_schedule import get_noise_schedule
 from utils.diffusion import GaussianDiffusion
-from utils.analyse_angle import get_angle_info
 from models.cond_unet import ConditionalUNet
+from utils.analyse_angle import get_angle_info
 
-# macOS 特定设置
-if platform.system() == "Darwin":
-    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-# ==================== 配置参数（直接在这里修改） ====================
-# 基础配置
-MASK_PATH = "./data/mask/patient001.nii.gz"  # 掩码文件路径（.nii.gz 或 .npy）
-CHECKPOINT_PATH = "./checkpoints_ct_3d_angle/best_model.pt"  # 模型检查点路径
-OUTPUT_DIR = "./generated_samples"  # 输出目录
-
-# 采样配置
-NUM_SAMPLES = 4  # 生成样本数量
-SPECIFIC_ANGLE = None  # 指定生成角度（度），None表示从文件名解析，例如: 45
-USE_SAMPLER = None  # 采样器类型，None使用配置文件设置，可选: "ddpm", "ddim"
-DEVICE = None  # 设备，None自动选择，可选: "cuda", "cpu"
-
-# 可视化配置
-SHOW_COMPARISON = True  # 是否显示对比图
-SHOW_PROCESS = True  # 是否显示生成过程
-SAVE_INDIVIDUAL = True  # 是否保存单个图像
-# ==================================================================
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 def load_model(checkpoint_path, config, device):
-    """加载训练好的模型"""
+    """加载训练好的模型（优先 EMA 版本）"""
+    ema_path = checkpoint_path.replace('.pt', '_ema.pt')
+    if os.path.exists(ema_path):
+        print(f"Loading EMA model from {ema_path}")
+        checkpoint = torch.load(ema_path, map_location=device, weights_only=False)
+    else:
+        print(f"Loading model from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
     model = ConditionalUNet(
         in_channels=config.channels,
         out_channels=config.channels,
@@ -49,159 +57,59 @@ def load_model(checkpoint_path, config, device):
         cond_dim=config.cond_dim,
         time_emb_dim=config.time_emb_dim,
         block_type=config.cond_block_type,
-        mask_type=config.mask_type,
+        mask_type="3d",
         use_angle=config.use_angle_condition,
-        angle_dim=config.angle_dim
+        angle_dim=config.angle_dim,
+        use_non_angio=config.use_non_angio
     ).to(device)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-
-    print(f"✓ 加载模型: {checkpoint_path}")
-    if 'epoch' in checkpoint:
-        print(f"  训练轮次: {checkpoint['epoch']}")
-    if 'loss' in checkpoint:
-        print(f"  训练损失: {checkpoint['loss']:.6f}")
-
+    print(f"Loaded model epoch {checkpoint.get('epoch', 'unknown')}, loss {checkpoint.get('loss', 'unknown'):.6f}")
     return model
 
 
-def load_3d_mask(mask_path, target_size=(64, 64, 64), device='cpu'):
-    """加载3D掩码（.nii.gz）"""
-    try:
-        import nibabel as nib
-    except ImportError:
-        raise ImportError("需要安装 nibabel: pip install nibabel")
-
+def load_3d_mask(mask_path, target_size, device):
+    """加载3D掩码并下采样"""
     nii = nib.load(mask_path)
-    mask_3d = nii.get_fdata()
-    mask_3d = mask_3d[np.newaxis, ...]  # [1, D, H, W]
+    mask_3d = nii.get_fdata()[np.newaxis, ...]
     mask_tensor = torch.from_numpy(mask_3d).float()
-
-    # 下采样到目标尺寸
     if mask_tensor.shape[1:] != target_size:
         mask_tensor = mask_tensor.unsqueeze(0)
         mask_tensor = torch.nn.functional.interpolate(
-            mask_tensor,
-            size=target_size,
-            mode='trilinear',
-            align_corners=False
+            mask_tensor, size=target_size, mode='trilinear', align_corners=False
         )
         mask_tensor = mask_tensor.squeeze(0)
-
-    # 归一化到[0,1]
     if mask_tensor.max() > 0:
         mask_tensor = mask_tensor / mask_tensor.max()
-
     return mask_tensor.to(device)
 
 
-def load_2d_mask(mask_path, target_size=(256, 256), device='cpu'):
-    """加载2D MIP掩码（.npy）"""
-    mip_array = np.load(mask_path)
-
-    # 调整尺寸
-    if mip_array.shape != target_size:
-        try:
-            from scipy.ndimage import zoom
-        except ImportError:
-            raise ImportError("需要安装 scipy: pip install scipy")
-
-        zoom_factors = (target_size[0] / mip_array.shape[0],
-                        target_size[1] / mip_array.shape[1])
-        mip_array = zoom(mip_array, zoom_factors, order=1)
-
-    mask_tensor = torch.from_numpy(mip_array).float().unsqueeze(0)  # [1, H, W]
-    return mask_tensor.to(device)
+def load_image(image_path, target_size, device, to_range="01"):
+    """加载任意2D图像"""
+    img = Image.open(image_path).convert('L')
+    img = img.resize(target_size, Image.BILINEAR)
+    img_tensor = transforms.ToTensor()(img)
+    if to_range == "minus1_1":
+        img_tensor = img_tensor * 2 - 1
+    return img_tensor.unsqueeze(0).to(device)
 
 
-def parse_angle_from_mask_path(mask_path, config):
-    """从掩码文件路径解析角度信息"""
-    filename = os.path.basename(mask_path)
-
-    if config.mask_type == "3d":
-        print(f"⚠ 3D掩码文件名 '{filename}' 不包含角度信息，使用默认角度 0°")
-        angle_info = get_angle_info("patient_0_mask.png", angle_rep=config.angle_rep)
-    else:
-        base_name = filename.replace('_mip.npy', '')
-        virtual_filename = f"{base_name}_0_mask.png"
-        print(f"⚠ 2D MIP文件名 '{filename}' 不包含角度信息，使用默认角度 0°")
-        angle_info = get_angle_info(virtual_filename, angle_rep=config.angle_rep)
-
-    angle_tensor = torch.from_numpy(angle_info['angle_vector']).float()
-
-    print(f"  解析角度: {angle_info['angle_deg']}°")
-    print(f"  角度表示: {config.angle_rep}")
-
-    return angle_tensor, angle_info
-
-
-def visualize_mask(mask_tensor, mask_type):
-    """可视化掩码（返回适合imshow的numpy数组）"""
-    mask_np = mask_tensor[0].cpu().numpy()
-
-    if mask_type == "2d":
-        return mask_np
-    else:
-        # 3D掩码：取中间切片
-        mid_slice = mask_np.shape[0] // 2
-        return mask_np[mid_slice]
+def get_angle_from_filename(filename, angle_rep):
+    """从文件名解析角度向量"""
+    info = get_angle_info(os.path.basename(filename), angle_rep=angle_rep)
+    return torch.from_numpy(info['angle_vector']).float()
 
 
 @torch.no_grad()
-def sample_with_mask(model, diffusion, mask_path, config, device, num_samples=4,
-                     save_dir=None, specific_angle=None):
-    """使用给定的掩码生成图像"""
+def sample_conditional(model, diffusion, mask_tensor, angle_tensor, non_angio_tensor,
+                       config, device, num_samples):
+    """执行条件采样，生成 num_samples 个样本"""
+    mask_batch = mask_tensor.repeat(num_samples, 1, 1, 1, 1)
+    angle_batch = angle_tensor.repeat(num_samples, 1) if angle_tensor is not None else None
+    non_angio_batch = non_angio_tensor.repeat(num_samples, 1, 1, 1) if non_angio_tensor is not None else None
 
-    # 根据类型加载掩码
-    print(f"\n📂 加载掩码: {mask_path}")
-    if config.mask_type == "2d":
-        mask = load_2d_mask(
-            mask_path,
-            target_size=(config.image_size, config.image_size),
-            device=device
-        )
-        print(f"  2D MIP掩码形状: {mask.shape}")
-        mask_batch = mask.repeat(num_samples, 1, 1, 1)
-    else:
-        mask = load_3d_mask(
-            mask_path,
-            target_size=config.mask_3d_size,
-            device=device
-        )
-        print(f"  3D掩码形状: {mask.shape}")
-        mask_batch = mask.repeat(num_samples, 1, 1, 1, 1)
-
-    print(f"  掩码范围: [{mask.min():.3f}, {mask.max():.3f}]")
-
-    # 解析角度信息
-    print(f"\n📐 解析角度信息:")
-    if specific_angle is not None:
-        import math
-        angle_rad = math.radians(specific_angle)
-        from utils.analyse_angle import euler_to_quaternion
-
-        if config.angle_rep == "quaternion":
-            angle_vector = euler_to_quaternion(angle_rad)
-        else:
-            angle_vector = np.array([0.0, 0.0, angle_rad], dtype=np.float32)
-
-        angle = torch.from_numpy(angle_vector).float().to(device)
-        print(f"  使用指定角度: {specific_angle}°")
-    else:
-        angle, angle_info = parse_angle_from_mask_path(mask_path, config)
-        angle = angle.to(device)
-
-    angle_batch = angle.repeat(num_samples, 1)
-
-    # 生成样本
-    print(f"\n🎨 生成 {num_samples} 个样本...")
-    print(f"  采样器: {config.sampler_type}")
-    if config.sampler_type == "ddim":
-        print(f"  DDIM步数: {config.ddim_steps}, eta: {config.ddim_eta}")
-
-    samples, intermediates = diffusion.sample(
+    samples, _ = diffusion.sample(
         model,
         config.image_size,
         batch_size=num_samples,
@@ -211,220 +119,170 @@ def sample_with_mask(model, diffusion, mask_path, config, device, num_samples=4,
         eta=config.ddim_eta,
         mask=mask_batch,
         angle=angle_batch,
-        progress=True
+        non_angio=non_angio_batch,
+        progress=False
     )
-
-    # 反归一化
+    # 反归一化到 [0,1]
     samples = (samples + 1) / 2
     samples = torch.clamp(samples, 0, 1)
+    return samples
 
-    # 保存结果
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
 
-        # 保存单个图像
-        if SAVE_INDIVIDUAL:
-            for i in range(num_samples):
-                save_path = os.path.join(save_dir, f"sample_{i}.png")
-                save_image(samples[i], save_path)
-            print(f"  ✓ 保存 {num_samples} 个单独图像")
+def scan_test_folder(test_root):
+    """
+    扫描 TEST 文件夹，返回所有待测试的样本信息列表。
+    每个样本为一个字典: {
+        'patient': 患者ID,
+        'view': 视角编号,
+        'mask_path': 3D掩码路径,
+        'gt_path': 真实造影图像路径,
+        'non_angio_path': 无造影CT路径（可能为 None）
+    }
+    """
+    mask_dir = os.path.join(test_root, 'mask')
+    angio_dir = os.path.join(test_root, 'angiographs')
+    non_angio_dir = os.path.join(test_root, 'non_angiographs') if os.path.exists(os.path.join(test_root, 'non_angiographs')) else None
 
-        # 保存网格图
-        grid_path = os.path.join(save_dir, "grid.png")
-        save_image(samples, grid_path, nrow=int(np.ceil(np.sqrt(num_samples))))
-        print(f"  ✓ 保存网格图: grid.png")
+    samples = []
 
-        # 保存对比图
-        if SHOW_COMPARISON:
-            display_num = min(8, num_samples)
-            fig, axes = plt.subplots(2, display_num, figsize=(2 * display_num, 4))
-            if display_num == 1:
-                axes = axes.reshape(-1, 1)
+    # 获取所有掩码文件（.nii.gz 或 .nii）
+    mask_files = [f for f in os.listdir(mask_dir) if f.endswith(('.nii.gz', '.nii'))]
+    for mask_file in mask_files:
+        # 患者ID = 文件名去除扩展名
+        patient_id = mask_file.replace('.nii.gz', '').replace('.nii', '')
+        mask_path = os.path.join(mask_dir, mask_file)
 
-            for i in range(display_num):
-                # 第一行：条件掩码
-                mask_disp = visualize_mask(mask, config.mask_type)
-                axes[0, i].imshow(mask_disp, cmap='hot')
+        # 对应的 angiographs 文件夹
+        patient_angio_dir = os.path.join(angio_dir, patient_id)
+        if not os.path.isdir(patient_angio_dir):
+            print(f"Warning: No angiographs folder for patient {patient_id}, skip")
+            continue
 
-                angle_text = f"{specific_angle}°" if specific_angle is not None else f"{angle_info['angle_deg']}°"
-                axes[0, i].set_title(f"Mask + {angle_text}", fontsize=8)
-                axes[0, i].axis('off')
+        # 遍历该患者的所有造影图像（假设命名格式为 patient_id_{view}_mask.png）
+        angio_files = [f for f in os.listdir(patient_angio_dir) if f.endswith('.png')]
+        for angio_file in angio_files:
+            # 提取视角编号
+            parts = angio_file.replace('.png', '').split('_')
+            if len(parts) < 2:
+                continue
+            try:
+                view = int(parts[-2])   # 倒数第二个是视角编号，如 patient001_0_mask -> 0
+            except:
+                continue
+            gt_path = os.path.join(patient_angio_dir, angio_file)
 
-                # 第二行：生成结果
-                sample_disp = samples[i, 0].cpu().numpy()
-                axes[1, i].imshow(sample_disp, cmap='gray')
-                axes[1, i].set_title(f"Sample {i+1}", fontsize=8)
-                axes[1, i].axis('off')
+            # 无造影CT路径（如果存在）
+            non_angio_path = None
+            if non_angio_dir is not None:
+                candidate = os.path.join(non_angio_dir, patient_id, angio_file)
+                if os.path.exists(candidate):
+                    non_angio_path = candidate
 
-            plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, "comparison.png"), dpi=150)
-            plt.close()
-            print(f"  ✓ 保存对比图: comparison.png")
-
-        # 保存生成过程
-        if SHOW_PROCESS and len(intermediates) > 0:
-            num_steps_to_show = min(5, len(intermediates))
-            fig, axes = plt.subplots(1, num_steps_to_show,
-                                      figsize=(3 * num_steps_to_show, 3))
-            if num_steps_to_show == 1:
-                axes = [axes]
-
-            step_indices = np.linspace(0, len(intermediates)-1, num_steps_to_show, dtype=int)
-            for idx, step_idx in enumerate(step_indices):
-                img = intermediates[step_idx]
-                img_display = (img[0, 0] + 1) / 2
-                axes[idx].imshow(img_display.cpu().numpy(), cmap='gray')
-                axes[idx].axis('off')
-
-                if config.sampler_type == "ddpm":
-                    step_num = (len(intermediates) - 1 - step_idx) * (config.timesteps // len(intermediates))
-                else:
-                    step_num = (len(intermediates) - 1 - step_idx) * (config.ddim_steps // len(intermediates))
-                axes[idx].set_title(f'Step {step_num}', fontsize=10)
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, "process.png"), dpi=150)
-            plt.close()
-            print(f"  ✓ 保存生成过程: process.png")
-
-        # 保存元数据
-        import json
-        metadata = {
-            'mask_path': mask_path,
-            'mask_type': config.mask_type,
-            'num_samples': num_samples,
-            'sampler_type': config.sampler_type,
-            'ddim_steps': config.ddim_steps if config.sampler_type == "ddim" else None,
-            'image_size': config.image_size,
-            'angle_value': float(specific_angle) if specific_angle is not None else float(angle_info['angle_deg'])
-        }
-
-        with open(os.path.join(save_dir, "metadata.json"), 'w') as f:
-            json.dump(metadata, f, indent=4)
-        print(f"  ✓ 保存元数据: metadata.json")
-
-    return samples, mask
+            samples.append({
+                'patient': patient_id,
+                'view': view,
+                'mask_path': mask_path,
+                'gt_path': gt_path,
+                'non_angio_path': non_angio_path
+            })
+    return samples
 
 
 def main():
-    """主函数 - 直接运行即可"""
+    # ==================== 配置参数 ====================
+    TEST_ROOT = "./TEST"                # TEST 文件夹根目录
+    OUTPUT_BASE = "./Generated"         # 输出根目录（内部自动按患者/视角组织）
+    CHECKPOINT_NAME = "best_model.pt"   # 检查点文件名
+    NUM_SAMPLES = 4                     # 每个条件生成几张图像
+    # =================================================
 
-    print("=" * 60)
-    print("🎯 条件扩散模型 - 肺动脉造影生成")
-    print("=" * 60)
-
-    # 加载配置
     config = Config()
+    device = config.device
 
-    # 应用用户配置
-    if USE_SAMPLER:
-        config.sampler_type = USE_SAMPLER
+    print("="*60)
+    print("批量采样 - 自动处理 TEST 文件夹")
+    print(f"Test root: {TEST_ROOT}")
+    print(f"Output base: {OUTPUT_BASE}")
+    print(f"Device: {device}")
+    print("="*60)
 
-    device = DEVICE if DEVICE else config.device
+    # 检查 TEST 文件夹是否存在
+    if not os.path.isdir(TEST_ROOT):
+        raise NotADirectoryError(f"TEST folder not found: {TEST_ROOT}")
 
-    # 打印配置信息
-    print(f"\n⚙️  运行配置:")
-    print(f"  设备: {device}")
-    print(f"  掩码文件: {MASK_PATH}")
-    print(f"  模型检查点: {CHECKPOINT_PATH}")
-    print(f"  输出目录: {OUTPUT_DIR}")
-    print(f"  样本数量: {NUM_SAMPLES}")
-    print(f"  掩码类型: {config.mask_type}")
-    print(f"  采样器: {config.sampler_type}")
-    if SPECIFIC_ANGLE:
-        print(f"  指定角度: {SPECIFIC_ANGLE}°")
-    else:
-        print(f"  角度: 从文件名自动解析")
+    # 加载模型（仅一次）
+    checkpoint_full = os.path.join(config.checkpoint_dir, CHECKPOINT_NAME)
+    model = load_model(checkpoint_full, config, device)
 
-    # 检查文件是否存在
-    if not os.path.exists(MASK_PATH):
-        print(f"\n❌ 错误: 掩码文件不存在!")
-        print(f"   路径: {MASK_PATH}")
-        print(f"   请修改 MASK_PATH 变量为正确的文件路径")
+    # 扩散过程
+    betas = get_noise_schedule(config)
+    diffusion = GaussianDiffusion(betas, device, prediction_type=config.prediction_type)
+
+    # 获取所有测试样本
+    samples = scan_test_folder(TEST_ROOT)
+    print(f"Found {len(samples)} test samples (patient-view pairs).")
+
+    if not samples:
+        print("No samples found. Please check TEST folder structure.")
         return
 
-    if not os.path.exists(CHECKPOINT_PATH):
-        print(f"\n❌ 错误: 模型检查点不存在!")
-        print(f"   路径: {CHECKPOINT_PATH}")
-        print(f"   请修改 CHECKPOINT_PATH 变量为正确的检查点路径")
-        return
+    # 逐个处理样本
+    for sample in tqdm(samples, desc="Processing samples"):
+        patient = sample['patient']
+        view = sample['view']
+        mask_path = sample['mask_path']
+        gt_path = sample['gt_path']
+        non_angio_path = sample['non_angio_path']
 
-    try:
-        # 加载模型
-        print(f"\n🔧 加载模型...")
-        model = load_model(CHECKPOINT_PATH, config, device)
+        # 创建该样本的输出子目录
+        output_dir = os.path.join(OUTPUT_BASE, patient, f"view_{view}")
+        os.makedirs(output_dir, exist_ok=True)
 
-        # 初始化扩散过程
-        betas = get_noise_schedule(config)
-        diffusion = GaussianDiffusion(betas, device)
+        # 加载条件
+        mask = load_3d_mask(mask_path, config.mask_3d_size, device)
+        if config.use_angle_condition:
+            angle = get_angle_from_filename(gt_path, config.angle_rep)
+            angle = angle.unsqueeze(0).to(device)
+        else:
+            angle = None
+        non_angio = None
+        if config.use_non_angio and non_angio_path is not None:
+            non_angio = load_image(non_angio_path, (config.image_size, config.image_size), device, to_range="minus1_1")
+        elif config.use_non_angio:
+            print(f"Warning: No non-angio image for {patient} view {view}, using zeros.")
+            non_angio = torch.zeros(1, 1, config.image_size, config.image_size).to(device)
 
-        # 生成样本
-        samples, mask = sample_with_mask(
-            model=model,
-            diffusion=diffusion,
-            mask_path=MASK_PATH,
-            config=config,
-            device=device,
-            num_samples=NUM_SAMPLES,
-            save_dir=OUTPUT_DIR,
-            specific_angle=SPECIFIC_ANGLE
-        )
-
-        print("\n" + "=" * 60)
-        print("✅ 生成完成!")
-        print("=" * 60)
-        print(f"\n📁 结果保存在: {OUTPUT_DIR}/")
-        if SAVE_INDIVIDUAL:
-            print(f"  - 单独图像: sample_*.png")
-        print(f"  - 网格图: grid.png")
-        if SHOW_COMPARISON:
-            print(f"  - 对比图: comparison.png")
-        if SHOW_PROCESS:
-            print(f"  - 生成过程: process.png")
-        print(f"  - 元数据: metadata.json")
-
-        # 尝试自动打开输出文件夹
+        # 真实图像（用于对比）
         try:
-            import subprocess
-            if platform.system() == "Windows":
-                os.startfile(OUTPUT_DIR)
-            elif platform.system() == "Darwin":  # macOS
-                subprocess.run(["open", OUTPUT_DIR])
-            else:  # Linux
-                subprocess.run(["xdg-open", OUTPUT_DIR])
-            print(f"\n📂 已自动打开输出文件夹")
-        except:
-            pass
+            gt_image = load_image(gt_path, (config.image_size, config.image_size), device, to_range="01")
+        except Exception as e:
+            print(f"Failed to load GT image {gt_path}: {e}, skip.")
+            continue
 
-    except Exception as e:
-        print(f"\n❌ 运行出错: {e}")
-        import traceback
-        traceback.print_exc()
-        print("\n💡 提示:")
-        print("  1. 检查掩码文件路径是否正确")
-        print("  2. 检查模型检查点是否完整")
-        print("  3. 确保已安装所有依赖: nibabel, scipy")
+        # 采样生成
+        samples_gen = sample_conditional(model, diffusion, mask, angle, non_angio,
+                                         config, device, NUM_SAMPLES)
+
+        # 保存生成图像
+        for i, s in enumerate(samples_gen):
+            save_image(s, os.path.join(output_dir, f"sample_{i:02d}.png"))
+        save_image(samples_gen, os.path.join(output_dir, "grid.png"), nrow=2)
+
+        # 生成对比图（GT vs 第一个生成样本）
+        fig, axes = plt.subplots(1, 2, figsize=(6, 3))
+        gt_disp = gt_image[0, 0].cpu().numpy()
+        axes[0].imshow(gt_disp, cmap='gray')
+        axes[0].set_title("Ground Truth")
+        axes[0].axis('off')
+        axes[1].imshow(samples_gen[0, 0].cpu().numpy(), cmap='gray')
+        axes[1].set_title("Generated")
+        axes[1].axis('off')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "comparison.png"), dpi=150)
+        plt.close()
+
+    print(f"\nBatch sampling completed. Results saved to {OUTPUT_BASE}")
 
 
 if __name__ == "__main__":
-    # 直接运行即可！
     main()
-
-    # ==================== 使用示例 ====================
-    # 示例1: 生成单个掩码的多个视角
-    # MASK_PATH = "./data/mask/patient001.nii.gz"
-    # NUM_SAMPLES = 4
-    # SPECIFIC_ANGLE = 45  # 生成45度视角
-
-    # 示例2: 批量生成不同角度（需要手动修改循环）
-    # for angle in [0, 22.5, 45, 67.5, 90]:
-    #     SPECIFIC_ANGLE = angle
-    #     OUTPUT_DIR = f"./generated_angle_{angle}"
-    #     main()
-
-    # 示例3: 处理多个患者
-    # patients = ["patient001", "patient002", "patient003"]
-    # for patient in patients:
-    #     MASK_PATH = f"./data/mask/{patient}.nii.gz"
-    #     OUTPUT_DIR = f"./results/{patient}"
-    #     main()
