@@ -73,9 +73,9 @@ class PulmonaryAngiographyDataset(Dataset):
         self.use_non_angio = use_non_angio
 
         # 目录路径
-        self.angiographs_dir = os.path.join(root_dir, 'test_angiographs')
+        self.angiographs_dir = os.path.join(root_dir, 'angiographs')
         if use_non_angio:
-            self.non_angiographs_dir = os.path.join(root_dir, 'test_non_angiographs')
+            self.non_angiographs_dir = os.path.join(root_dir, 'non_angiographs')
 
         # 根据类型选择掩码目录
         if mask_type == "2d":
@@ -299,6 +299,3 @@ def create_dataloader(shuffle=True):
     )
 
     return dataloader
-
-
-# 测试代码保留原样，可自行更新（省略）

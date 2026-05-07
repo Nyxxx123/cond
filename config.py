@@ -21,6 +21,13 @@ class Config:
     lpips_loss_weight = 0.1  # LPIPS损失权重（建议0.05-0.5）
     lpips_net = "alex"  # 可选: "alex", "vgg"
 
+    # ========== 新增：MS-SSIM感知损失配置 ==========
+    use_ms_ssim = True                # 是否使用 MS-SSIM 损失
+    ms_ssim_loss_weight = 0.1         # MS-SSIM 损失权重（建议 0.05-0.2）
+    ms_ssim_kernel_size = 11          # 高斯核大小，默认 11
+    ms_ssim_sigma = 1.5               # 高斯核标准差，默认 1.5
+    # =============================================
+
     # GAN配置
     use_gan = False  # 开关：True=启用GAN
     gan_loss_weight = 0.05  # GAN损失权重
@@ -80,5 +87,5 @@ class Config:
     sample_frequency = 25  # 每5个epoch采样一次
 
     # 日志和保存
-    checkpoint_dir = "./checkpoints_ct_all_infor-v"
-    sample_dir = "./samples_ct_all_infor-v"
+    checkpoint_dir = "./checkpoints_ct_all_infor-v-ssim"
+    sample_dir = "./samples_ct_all_infor-v-ssim"

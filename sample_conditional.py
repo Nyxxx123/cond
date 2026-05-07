@@ -191,7 +191,7 @@ def scan_test_folder(test_root):
 def main():
     # ==================== 配置参数 ====================
     TEST_ROOT = "./TEST"                # TEST 文件夹根目录
-    OUTPUT_BASE = "./Generated"         # 输出根目录（内部自动按患者/视角组织）
+    OUTPUT_BASE = "./Generated-l&g&s"         # 输出根目录（内部自动按患者/视角组织）
     CHECKPOINT_NAME = "best_model.pt"   # 检查点文件名
     NUM_SAMPLES = 4                     # 每个条件生成几张图像
     # =================================================
