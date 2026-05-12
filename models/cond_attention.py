@@ -1,5 +1,5 @@
 """
-条件注意力模块 - 采用您项目的实现风格
+条件注意力模块
 """
 
 import torch
@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 class CrossAttention(nn.Module):
     """
-    交叉注意力模块 - 完全复制您项目中的实现
+    交叉注意力模块
 
     将条件向量作为Key/Value，U-Net特征图作为Query
     """
@@ -83,7 +83,7 @@ class CrossAttention(nn.Module):
 
 class ConditionedBlock(nn.Module):
     """
-    基础卷积块 + 时间条件 + 交叉注意力（使用您项目的CrossAttention风格）
+    基础卷积块 + 时间条件 + 交叉注意力
     """
 
     def __init__(self, in_ch, out_ch, time_emb_dim=None, cond_dim=None, num_heads=4):
