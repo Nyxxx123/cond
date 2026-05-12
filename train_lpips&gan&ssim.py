@@ -20,7 +20,7 @@ from models.cond_unet import ConditionalUNet
 
 # 只在启用GAN时导入判别器
 if Config().use_gan:
-    from models.discriminator import Discriminator
+    from models.discriminator import Discriminator, CondDiscriminator  # 修改：导入条件判别器
 
 # 只在启用MS-SSIM时导入
 from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
@@ -168,6 +168,7 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
     total_ms_ssim_loss = 0
     total_gan_loss = 0
     total_loss_D = 0
+    disc_update_count = 0
     num_batches = len(dataloader)
 
     # ========== 判断是否启用GAN（推迟启动） ==========
@@ -244,9 +245,15 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
         if config.use_ms_ssim:
             loss_G = loss_G + config.ms_ssim_loss_weight * ms_ssim_loss_val
 
+        # ========== GAN损失（生成器部分，使用条件判别器） ==========
         if use_gan:
-            fake_pred = discriminator(x0_pred)
-            gen_loss = F.mse_loss(fake_pred, torch.ones_like(fake_pred))
+            # 获取条件向量（复用模型的条件编码器）
+            cond_vector = model.cond_encoder(masks, angles, non_angio)
+            # 条件判别器输入图像+条件
+            fake_pred = discriminator(x0_pred, cond_vector) if config.cond_discriminator else discriminator(x0_pred)
+            # 标签平滑，防止判别器过自信
+            gan_target = torch.ones_like(fake_pred) * 0.9
+            gen_loss = F.mse_loss(fake_pred, gan_target)
             loss_G = loss_G + config.gan_loss_weight * gen_loss
             total_gan_loss += gen_loss.item()
 
@@ -258,21 +265,31 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
         optimizer_G.step()
 
         # ========== 判别器前向（独立） ==========
-        if use_gan:
+        if use_gan and (batch_idx % config.disc_update_freq == 0):
+            disc_update_count += 1
             with torch.no_grad():
-                # 重新前向传播（传递 non_angio）
+                # 重新前向传播获取 x0_pred_disc 和 cond_vector
                 model_output_disc = model(x_noisy, masks, angles, non_angio=non_angio, t=t)
                 if config.prediction_type == "epsilon":
                     x0_pred_disc = diffusion.predict_x0_from_noise(x_noisy, model_output_disc, t)
                 else:
                     x0_pred_disc = diffusion.predict_x0_from_v(x_noisy, model_output_disc, t)
                     x0_pred_disc = torch.clamp(x0_pred_disc, -1.0, 1.0)
+                cond_vector_disc = model.cond_encoder(masks, angles, non_angio)
 
-            real_pred = discriminator(targets)
-            fake_pred = discriminator(x0_pred_disc)
+            # 条件判别器输入
+            if config.cond_discriminator:
+                real_pred = discriminator(targets, cond_vector_disc)
+                fake_pred_disc = discriminator(x0_pred_disc, cond_vector_disc)
+            else:
+                real_pred = discriminator(targets)
+                fake_pred_disc = discriminator(x0_pred_disc)
 
-            real_loss = F.mse_loss(real_pred, torch.ones_like(real_pred))
-            fake_loss = F.mse_loss(fake_pred, torch.zeros_like(fake_pred))
+            # 标签平滑
+            real_target = torch.ones_like(real_pred) * 0.9
+            fake_target = torch.zeros_like(fake_pred_disc) + 0.1
+            real_loss = F.mse_loss(real_pred, real_target)
+            fake_loss = F.mse_loss(fake_pred_disc, fake_target)
             disc_loss = (real_loss + fake_loss) / 2
 
             total_loss_D += disc_loss.item()
@@ -303,7 +320,8 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
     avg_lpips = total_lpips_loss / num_batches if config.use_lpips else 0
     avg_ms_ssim = total_ms_ssim_loss / num_batches if config.use_ms_ssim else 0
     avg_gan = total_gan_loss / num_batches if use_gan else 0
-    avg_loss_D = total_loss_D / num_batches if use_gan else 0
+    # ========== 修正：使用 disc_update_count 作为分母 ==========
+    avg_loss_D = total_loss_D / disc_update_count if (use_gan and disc_update_count > 0) else 0
 
     return avg_loss_G, avg_mse, avg_lpips, avg_ms_ssim, avg_gan, avg_loss_D
 
@@ -367,7 +385,12 @@ def main():
 
     if config.use_gan:
         print("Creating discriminator...")
-        discriminator = Discriminator(in_channels=config.channels).to(config.device)
+        if config.cond_discriminator:
+            discriminator = CondDiscriminator(in_channels=config.channels, cond_dim=config.cond_dim).to(config.device)
+            print("Using conditional discriminator")
+        else:
+            discriminator = Discriminator(in_channels=config.channels).to(config.device)
+            print("Using unconditional discriminator")
         disc_params = sum(p.numel() for p in discriminator.parameters())
         print(f"Discriminator parameters: {disc_params / 1e6:.2f}M")
         optimizer_D = torch.optim.AdamW(

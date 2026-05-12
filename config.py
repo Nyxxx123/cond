@@ -30,9 +30,12 @@ class Config:
 
     # GAN配置
     use_gan = False  # 开关：True=启用GAN
-    gan_loss_weight = 0.05  # GAN损失权重
-    disc_lr = 5e-5  # 判别器学习率
-    gan_start_epoch = 100
+    gan_loss_weight = 1.0  # GAN损失权重
+    disc_lr = 1e-5  # 判别器学习率
+    gan_start_epoch = 200
+    # ========== 新增：条件判别器相关配置 ==========
+    cond_discriminator = True        # 是否使用条件判别器（推荐）
+    disc_update_freq = 3             # 每2个batch更新一次判别器
 
     # 数据参数 - CT图像
     batch_size = 4
@@ -87,5 +90,5 @@ class Config:
     sample_frequency = 25  # 每5个epoch采样一次
 
     # 日志和保存
-    checkpoint_dir = "./checkpoints_ct_all_infor-v-ssim"
-    sample_dir = "./samples_ct_all_infor-v-ssim"
+    checkpoint_dir = "./checkpoints_ct_all_infor-v-ssim(openGan)"
+    sample_dir = "./samples_ct_all_infor-v-ssim(openGan)"
