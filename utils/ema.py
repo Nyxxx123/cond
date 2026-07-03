@@ -1,6 +1,7 @@
 """
 EMA (Exponential Moving Average) 工具
 用于稳定训练，提升采样质量
+不采用
 """
 
 import copy

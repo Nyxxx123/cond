@@ -1,7 +1,7 @@
 """
 条件U-Net
 接收噪声图像和血管掩码条件，生成肺动脉造影图像
-支持掩码 + 角度 + 无造影CT多条件
+掩码 + 角度 + 无造影CT多条件
 """
 
 import torch
@@ -31,7 +31,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 class ConditionalUNet(nn.Module):
     """
-    条件U-Net（支持掩码+角度+无造影CT多条件）
+    条件U-Net（掩码+角度+无造影CT多条件）
     """
 
     def __init__(self,

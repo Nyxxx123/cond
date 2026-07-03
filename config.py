@@ -10,20 +10,20 @@ class Config:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 预测类型: "epsilon" 或 "v"
-    prediction_type = "v"  # 推荐使用 "v"，更稳定
+    prediction_type = "v"
 
     # EMA配置
-    ema_decay = 0.9999  # 衰减率，推荐0.999-0.9999
+    ema_decay = 0.9999  # 衰减率
     use_ema = False  # 是否使用EMA
 
     # LPIPS感知损失配置
     use_lpips = True  # 开关：True=启用LPIPS
-    lpips_loss_weight = 0.1  # LPIPS损失权重（建议0.05-0.5）
+    lpips_loss_weight = 0.5 # LPIPS损失权重
     lpips_net = "alex"  # 可选: "alex", "vgg"
 
-    # ========== 新增：MS-SSIM感知损失配置 ==========
+    # ========== MS-SSIM感知损失配置 ==========
     use_ms_ssim = True                # 是否使用 MS-SSIM 损失
-    ms_ssim_loss_weight = 0.1         # MS-SSIM 损失权重（建议 0.05-0.2）
+    ms_ssim_loss_weight = 0.5        # MS-SSIM 损失权重
     ms_ssim_kernel_size = 11          # 高斯核大小，默认 11
     ms_ssim_sigma = 1.5               # 高斯核标准差，默认 1.5
     # =============================================
@@ -31,27 +31,29 @@ class Config:
     # GAN配置
     use_gan = False  # 开关：True=启用GAN
     gan_loss_weight = 1.0  # GAN损失权重
-    disc_lr = 1e-5  # 判别器学习率
-    gan_start_epoch = 200
-    # ========== 新增：条件判别器相关配置 ==========
-    cond_discriminator = True        # 是否使用条件判别器（推荐）
+    disc_lr = 2e-4  # 判别器学习率
+    gan_start_epoch = 250
+
+    # ========== 条件判别器相关配置 ==========
+    cond_discriminator = True        # 是否使用条件判别器
     disc_update_freq = 3             # 每2个batch更新一次判别器
+    gan_refine_steps = 5             # GAN训练前DDIM精修步数，缩小训练-推理gap
 
     # 数据参数 - CT图像
     batch_size = 4
     image_size = 256  # CT图像尺寸
     channels = 1  # 灰度图
-    data_dir = "./PARSE"  # CT图像目录（支持子文件夹结构）
+    data_dir = "./PARSE"  # CT图像目录
     mip_cache_dir = "mask2D"  # MIP缓存目录名（相对于data_dir）
 
-    # ========== 新增：无造影CT条件配置 ==========
+    # ========== 无造影CT条件配置 ==========
     use_non_angio = True          # 是否使用无造影CT图作为条件
     # =======================================
 
     # 采样参数（新增 DDIM 配置）
     sampler_type = "ddpm"      # "ddpm" 或 "ddim"
-    ddim_steps = 50            # DDIM 采样步数（20-100，越高质量越好但越慢）
-    ddim_eta = 0.0             # DDIM 随机性（0=确定性，1=DDPM风格）
+    ddim_steps = 50            # DDIM 采样步数
+    ddim_eta = 0.0             # DDIM 随机性
 
     #掩码适配参数
     mask_type = "3d"  # "2d" 或 "3d"：使用2D MIP还是3D原始掩码
@@ -87,8 +89,8 @@ class Config:
 
     # 采样参数
     sample_batch_size = 16
-    sample_frequency = 25  # 每5个epoch采样一次
+    sample_frequency = 25  # 每25个epoch采样一次
 
     # 日志和保存
-    checkpoint_dir = "./checkpoints_ct_all_infor-v-ssim(openGan)"
-    sample_dir = "./samples_ct_all_infor-v-ssim(openGan)"
+    checkpoint_dir = "c_p/checkpoints_ct_all_infor-v-ssim(0.5,lpips 0.5,no Gan)"
+    sample_dir = "samples/samples_ct_all_infor-v-ssim(0.5,lpips 0.5,no Gan)"

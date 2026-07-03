@@ -22,7 +22,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 class Block(nn.Module):
     """
-    基础卷积块 - 修复通道数问题
+    基础卷积块
     """
     def __init__(self, in_ch, out_ch, time_emb_dim=None):
         super().__init__()
@@ -32,7 +32,7 @@ class Block(nn.Module):
         if time_emb_dim is not None:
             self.time_mlp = nn.Linear(time_emb_dim, out_ch)
         
-        # 使用GroupNorm，组数设为4（对于小网络更稳定）
+        # 使用GroupNorm，组数设为4
         self.norm1 = nn.GroupNorm(min(4, in_ch), in_ch)
         self.act1 = nn.SiLU()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
@@ -65,7 +65,7 @@ class Block(nn.Module):
 
 class UNet(nn.Module):
     """
-    简化的U-Net模型 - 带调试信息的稳定版本
+    简化的U-Net模型
     """
     def __init__(self, in_channels=1, out_channels=1, base_channels=64, time_emb_dim=256, debug=False):
         super().__init__()
@@ -125,7 +125,7 @@ class UNet(nn.Module):
         # 时间嵌入
         t_emb = self.time_mlp(t)
 
-        # 编码器 - 保存每层输出用于跳跃连接
+        # 编码器
         e1 = self.enc1(x, t_emb)  # [B, 64, H, W]
         e1_size = e1.shape[-2:]
 
@@ -141,7 +141,7 @@ class UNet(nn.Module):
         # 瓶颈
         b = self.bottleneck(self.downsample(e4), t_emb)  # [B, 512, H/16, W/16]
 
-        # 解码器 - 每次上采样后调整尺寸以匹配对应的编码器输出
+        # 解码器
         # 第4层
         b_up = self.upsample(b)  # [B, 512, H/8, W/8]
         b_up = self.adjust_size(b_up, e4_size)  # 调整到与e4相同尺寸

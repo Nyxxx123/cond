@@ -1,5 +1,5 @@
 """
-条件采样脚本 - 自动批量处理 TEST 文件夹
+条件采样脚本
 TEST 文件夹结构：
     TEST/
     ├── mask/                    # 3D 掩码 (.nii.gz)
@@ -12,7 +12,7 @@ TEST 文件夹结构：
     │   └── patient002/
     │       ├── patient002_0_mask.png
     │       └── ...
-    └── non_angiographs/         # 无造影CT（可选）
+    └── non_angiographs/         # 无造影CT
         ├── patient001/
         │   ├── patient001_0_mask.png
         │   └── patient001_1_mask.png
@@ -41,7 +41,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 def load_model(checkpoint_path, config, device):
-    """加载训练好的模型（优先 EMA 版本）"""
+    """加载训练好的模型"""
     ema_path = checkpoint_path.replace('.pt', '_ema.pt')
     if os.path.exists(ema_path):
         print(f"Loading EMA model from {ema_path}")
@@ -191,7 +191,7 @@ def scan_test_folder(test_root):
 def main():
     # ==================== 配置参数 ====================
     TEST_ROOT = "./TEST"                # TEST 文件夹根目录
-    OUTPUT_BASE = "./Generated-l&g&s"         # 输出根目录（内部自动按患者/视角组织）
+    OUTPUT_BASE = "./Generated-all-infor-v-ssim(0.5,lpips 0.5,no Gan)"         # 输出根目录
     CHECKPOINT_NAME = "best_model.pt"   # 检查点文件名
     NUM_SAMPLES = 4                     # 每个条件生成几张图像
     # =================================================

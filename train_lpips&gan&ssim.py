@@ -18,11 +18,11 @@ from utils.diffusion import GaussianDiffusion
 from utils.dataset import create_dataloader
 from models.cond_unet import ConditionalUNet
 
-# 只在启用GAN时导入判别器
-if Config().use_gan:
-    from models.discriminator import Discriminator, CondDiscriminator  # 修改：导入条件判别器
 
-# 只在启用MS-SSIM时导入
+if Config().use_gan:
+    from models.discriminator import Discriminator, CondDiscriminator
+
+
 from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -42,7 +42,7 @@ def sample_and_save(model, diffusion, dataloader, config, epoch):
         test_masks = batch['mask'][:config.sample_batch_size].to(config.device)
         test_angles = batch['angle'][:config.sample_batch_size].to(config.device)
         test_targets = batch['target'][:config.sample_batch_size]
-        # ========== 新增：获取无造影CT条件 ==========
+        # ========== 获取无造影CT条件 ==========
         if config.use_non_angio:
             test_non_angio = batch['non_angio'][:config.sample_batch_size].to(config.device)
         else:
@@ -54,7 +54,7 @@ def sample_and_save(model, diffusion, dataloader, config, epoch):
     num_samples = actual_batch_size
 
     with torch.no_grad():
-        # ========== 修改：传递 non_angio 参数 ==========
+        # ========== 传递 non_angio 参数 ==========
         samples, intermediates = diffusion.sample(
             model,
             config.image_size,
@@ -65,7 +65,7 @@ def sample_and_save(model, diffusion, dataloader, config, epoch):
             eta=config.ddim_eta,
             mask=test_masks,
             angle=test_angles,
-            non_angio=test_non_angio,   # 新增
+            non_angio=test_non_angio,
             progress=True
         )
         # ============================================
@@ -157,7 +157,7 @@ def save_loss_history(loss_history, save_dir="./"):
 
 def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lpips_loss_fn,
                     ms_ssim=None, discriminator=None, optimizer_D=None):
-    """训练一个epoch - 支持GAN推迟启动"""
+    """训练一个epoch"""
     model.train()
     if discriminator is not None:
         discriminator.train()
@@ -179,23 +179,23 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
         targets = batch['target'].to(config.device)
         masks = batch['mask'].to(config.device)
         angles = batch['angle'].to(config.device)
-        # ========== 新增：获取无造影CT条件 ==========
+
+        # 获取无造影CT条件
         if config.use_non_angio:
             non_angio = batch['non_angio'].to(config.device)
         else:
             non_angio = None
-        # ========================================
+
         batch_size = targets.shape[0]
 
         t = torch.randint(0, config.timesteps, (batch_size,), device=config.device).long()
         noise = torch.randn_like(targets)
         x_noisy = diffusion.q_sample(targets, t, noise)
 
-        # ========== 生成器前向（传递 non_angio） ==========
+        # 生成器前向（传递 non_angio）
         model_output = model(x_noisy, masks, angles, non_angio=non_angio, t=t)
-        # =============================================
 
-        # ========== 根据 prediction_type 计算正确的 target ==========
+        #  根据 prediction_type 计算正确的 target
         if config.prediction_type == "epsilon":
             target = noise
         else:  # v-prediction
@@ -205,26 +205,26 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
 
         # 计算 MSE 损失
         mse_loss = F.mse_loss(model_output, target)
-        # ==================================================
 
-        # ========== 计算 x0_pred ==========
+
+        # 计算 x0_pred
         if config.prediction_type == "epsilon":
             x0_pred = diffusion.predict_x0_from_noise(x_noisy, model_output, t)
         else:  # v-prediction
             x0_pred = diffusion.predict_x0_from_v(x_noisy, model_output, t)
             x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
 
-        # ========== LPIPS损失 ==========
+        # LPIPS损失
         if config.use_lpips:
             lpips_loss_val = lpips_loss_fn(x0_pred, targets).mean()
             total_lpips_loss += lpips_loss_val.item()
         else:
             lpips_loss_val = torch.tensor(0.0, device=config.device)
 
-        # ========== MS-SSIM损失 ==========
+        #  MS-SSIM损失
         if config.use_ms_ssim and ms_ssim is not None:
             # MS-SSIM 需要 RGB 三通道且值域 [0,1]
-            x0_pred_rgb = (x0_pred + 1) / 2  # 将 [-1,1] 转为 [0,1]（x0_pred在训练时被clamp到[-1,1]）
+            x0_pred_rgb = (x0_pred + 1) / 2
             targets_rgb = (targets + 1) / 2
             # 确保值域 [0,1]
             x0_pred_rgb = torch.clamp(x0_pred_rgb, 0, 1)
@@ -238,19 +238,28 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
         else:
             ms_ssim_loss_val = torch.tensor(0.0, device=config.device)
 
-        # ========== 生成器总损失 ==========
+        # 生成器总损失
         loss_G = mse_loss
         if config.use_lpips:
             loss_G = loss_G + config.lpips_loss_weight * lpips_loss_val
         if config.use_ms_ssim:
             loss_G = loss_G + config.ms_ssim_loss_weight * ms_ssim_loss_val
 
-        # ========== GAN损失（生成器部分，使用条件判别器） ==========
+        # GAN损失（生成器部分，使用条件判别器）
         if use_gan:
+            # 冻结判别器，防止 loss_G.backward() 时给 D 算无用梯度
+            discriminator.requires_grad_(False)
+
+            # G侧用单步x0_pred（保留梯度链），不用DDIM精修：
+            # refine_x0_ddim是@torch.no_grad()的，用它会切断G的梯度回传。
+            # 单步x0_pred虽比推理时粗糙，但数学上是当前t下x0的最优估计，
+            # D侧会看到精修后的赝品，弥补判别能力gap。
+            x0_for_g_loss = x0_pred
+
             # 获取条件向量（复用模型的条件编码器）
             cond_vector = model.cond_encoder(masks, angles, non_angio)
             # 条件判别器输入图像+条件
-            fake_pred = discriminator(x0_pred, cond_vector) if config.cond_discriminator else discriminator(x0_pred)
+            fake_pred = discriminator(x0_for_g_loss, cond_vector) if config.cond_discriminator else discriminator(x0_for_g_loss)
             # 标签平滑，防止判别器过自信
             gan_target = torch.ones_like(fake_pred) * 0.9
             gen_loss = F.mse_loss(fake_pred, gan_target)
@@ -264,26 +273,43 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         optimizer_G.step()
 
+        # 恢复判别器梯度（G 更新完毕）
+        if use_gan:
+            discriminator.requires_grad_(True)
+
         # ========== 判别器前向（独立） ==========
         if use_gan and (batch_idx % config.disc_update_freq == 0):
             disc_update_count += 1
-            with torch.no_grad():
-                # 重新前向传播获取 x0_pred_disc 和 cond_vector
-                model_output_disc = model(x_noisy, masks, angles, non_angio=non_angio, t=t)
-                if config.prediction_type == "epsilon":
-                    x0_pred_disc = diffusion.predict_x0_from_noise(x_noisy, model_output_disc, t)
-                else:
-                    x0_pred_disc = diffusion.predict_x0_from_v(x_noisy, model_output_disc, t)
-                    x0_pred_disc = torch.clamp(x0_pred_disc, -1.0, 1.0)
-                cond_vector_disc = model.cond_encoder(masks, angles, non_angio)
+
+            # 冻结生成器，避免给 G 算无用梯度
+            model.requires_grad_(False)
+
+            # 重新前向传播获取 x0_pred_disc 和 cond_vector
+            model_output_disc = model(x_noisy, masks, angles, non_angio=non_angio, t=t)
+            if config.prediction_type == "epsilon":
+                x0_pred_disc = diffusion.predict_x0_from_noise(x_noisy, model_output_disc, t)
+            else:
+                x0_pred_disc = diffusion.predict_x0_from_v(x_noisy, model_output_disc, t)
+                x0_pred_disc = torch.clamp(x0_pred_disc, -1.0, 1.0)
+
+            # DDIM精修（与G侧共用同一套精修逻辑）
+            if config.gan_refine_steps > 1:
+                x0_disc_gan = diffusion.refine_x0_ddim(
+                    model, x_noisy, t, mask=masks, angle=angles,
+                    non_angio=non_angio, refine_steps=config.gan_refine_steps
+                )
+            else:
+                x0_disc_gan = x0_pred_disc
+
+            cond_vector_disc = model.cond_encoder(masks, angles, non_angio)
 
             # 条件判别器输入
             if config.cond_discriminator:
                 real_pred = discriminator(targets, cond_vector_disc)
-                fake_pred_disc = discriminator(x0_pred_disc, cond_vector_disc)
+                fake_pred_disc = discriminator(x0_disc_gan, cond_vector_disc)
             else:
                 real_pred = discriminator(targets)
-                fake_pred_disc = discriminator(x0_pred_disc)
+                fake_pred_disc = discriminator(x0_disc_gan)
 
             # 标签平滑
             real_target = torch.ones_like(real_pred) * 0.9
@@ -299,6 +325,9 @@ def train_one_epoch(model, diffusion, dataloader, optimizer_G, config, epoch, lp
             if config.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip)
             optimizer_D.step()
+
+            # 恢复生成器梯度（D 更新完毕）
+            model.requires_grad_(True)
         # =================================
 
         total_loss_G += loss_G.item()

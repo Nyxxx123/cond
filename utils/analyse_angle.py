@@ -132,8 +132,8 @@ def get_angle_info(filename, angle_rep="quaternion"):
         'angle_deg': angle_deg,
         'angle_rad': angle_rad,
         'view_index': view_index,
-        'angle_vector': angle_vector,  # 统一名称
-        'rotation_matrix': get_rotation_matrix_z(angle_rad).numpy()  # 保留兼容
+        'angle_vector': angle_vector,
+        'rotation_matrix': get_rotation_matrix_z(angle_rad).numpy()
     }
 
 

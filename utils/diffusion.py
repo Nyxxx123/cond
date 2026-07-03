@@ -222,18 +222,21 @@ class GaussianDiffusion:
         return img, intermediates
 
     @torch.no_grad()
-    def sample_timestep_ddim(self, model, x, t, mask=None, angle=None, non_angio=None, eta=0.0):
+    def sample_timestep_ddim(self, model, x, t, t_prev, mask=None, angle=None, non_angio=None, eta=0.0):
         """
         DDIM 单步采样（支持 ε-prediction 和 v-prediction）
+
+        t: 当前DDIM子序列步（用于查 ᾱ_t）
+        t_prev: DDIM子序列的下一步（用于查 ᾱ_{t_prev}），必须传入，不能靠 alphas_cumprod_prev
         """
         alpha_cumprod_t = self._extract(self.alphas_cumprod, t, x.shape)
-        alpha_cumprod_t_prev = self._extract(self.alphas_cumprod_prev, t, x.shape)
+        alpha_cumprod_t_prev = self._extract(self.alphas_cumprod, t_prev, x.shape)
 
         sqrt_alpha_cumprod_t = torch.sqrt(alpha_cumprod_t)
         sqrt_alpha_cumprod_t_prev = torch.sqrt(alpha_cumprod_t_prev)
         sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alpha_cumprod_t)
 
-        # 模型预测
+        # 模型预测（时间嵌入使用当前步 t）
         # ========== 新增 non_angio 参数 ==========
         model_output = model(x, mask, angle=angle, non_angio=non_angio, t=t)
         # ======================================
@@ -285,19 +288,27 @@ class GaussianDiffusion:
         # ========================================
 
         intermediates = []
+        # 生成 DDIM 时间步子序列，从大到小排列
         ddim_timesteps = np.linspace(0, self.timesteps - 1, ddim_steps, dtype=int)[::-1]
 
         if progress:
-            pbar = tqdm(range(len(ddim_timesteps)), desc="DDIM Sampling")
+            pbar = tqdm(range(len(ddim_timesteps) - 1), desc="DDIM Sampling")
 
-        for i, step in enumerate(ddim_timesteps):
-            t = torch.full((batch_size,), step, device=self.device, dtype=torch.long)
+        # 注意：只迭代 len-1 次。第 i 次从 τ_i 跳到 τ_{i+1}
+        for i in range(len(ddim_timesteps) - 1):
+            step_curr = ddim_timesteps[i]      # 当前噪声水平 τ_i
+            step_next = ddim_timesteps[i + 1]  # 目标噪声水平 τ_{i+1}
+
+            t_curr = torch.full((batch_size,), step_curr, device=self.device, dtype=torch.long)
+            t_next = torch.full((batch_size,), step_next, device=self.device, dtype=torch.long)
+
             # ========== 新增 non_angio 参数 ==========
-            img = self.sample_timestep_ddim(model, img, t, mask=mask, angle=angle, non_angio=non_angio, eta=eta)
+            img = self.sample_timestep_ddim(model, img, t_curr, t_next,
+                                            mask=mask, angle=angle, non_angio=non_angio, eta=eta)
             # ======================================
             img = torch.clamp(img, -1.0, 1.0)
 
-            if i % max(1, len(ddim_timesteps) // 10) == 0 or i == len(ddim_timesteps) - 1:
+            if i % max(1, (len(ddim_timesteps) - 1) // 10) == 0 or i == len(ddim_timesteps) - 2:
                 intermediates.append(img.cpu())
 
             if progress:
@@ -345,3 +356,36 @@ class GaussianDiffusion:
         sin_phi_t = self._extract(self.sin_phi, t, x_t.shape)
         x0_pred = cos_phi_t * x_t - sin_phi_t * v_pred
         return x0_pred
+
+    @torch.no_grad()
+    def refine_x0_ddim(self, model, x_t, t, mask=None, angle=None, non_angio=None,
+                       refine_steps=5, eta=0.0):
+        """
+        用少量 DDIM 子步从 x_t 精修出更接近最终推理质量的 x_0。
+
+        训练时单步 predict_x0 在 t 较大时非常粗糙，
+        而推理时使用完整 DDPM/DDIM 多步采样，二者质量差距明显。
+        此方法在 [t-1, 0] 区间内均匀取 refine_steps 个子步，
+        执行确定性 DDIM 子序列采样，缩小训练-推理 gap。
+        """
+        if refine_steps <= 1:
+            return x_t
+
+        t_int = t[0].item()
+        if t_int < 2:
+            # t=0 或 t=1 时 x_t 已接近 x_0，无需精修；且 t_int-1 会产生无效索引
+            return x_t
+
+        sub_steps = np.linspace(t_int - 1, 0, refine_steps, dtype=int)
+
+        x = x_t
+        for i in range(len(sub_steps) - 1):
+            t_curr = torch.full_like(t, sub_steps[i])
+            t_next = torch.full_like(t, sub_steps[i + 1])
+            x = self.sample_timestep_ddim(
+                model, x, t_curr, t_next,
+                mask=mask, angle=angle, non_angio=non_angio, eta=eta
+            )
+            x = torch.clamp(x, -1.0, 1.0)
+
+        return x

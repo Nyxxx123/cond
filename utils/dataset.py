@@ -49,7 +49,7 @@ from utils.analyse_angle import get_angle_info
 
 class PulmonaryAngiographyDataset(Dataset):
     """
-    肺动脉造影数据集（支持2D MIP或3D原始掩码，支持无造影CT条件）
+    肺动脉造影数据集
     """
 
     def __init__(self, root_dir, image_size=256, mask_type="3d",
@@ -176,7 +176,7 @@ class PulmonaryAngiographyDataset(Dataset):
                     print(f"警告: 跳过文件 {img_file}，{e}")
                     continue
 
-                # 检查无造影CT文件是否存在（如果启用）
+                # 检查无造影CT文件是否存在
                 non_angio_path = None
                 if self.use_non_angio:
                     non_angio_path = os.path.join(self.non_angiographs_dir, patient_folder, img_file)

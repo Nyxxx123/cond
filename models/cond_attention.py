@@ -10,8 +10,6 @@ import torch.nn.functional as F
 class CrossAttention(nn.Module):
     """
     交叉注意力模块
-
-    将条件向量作为Key/Value，U-Net特征图作为Query
     """
 
     def __init__(self, embed_dim, cond_dim, num_heads=8, dropout=0.1):
@@ -22,10 +20,10 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.scale = (embed_dim // num_heads) ** -0.5
 
-        # Query投影（来自U-Net特征）
+        # Query投影
         self.q_proj = nn.Linear(embed_dim, embed_dim)
 
-        # Key/Value投影（来自条件向量）
+        # Key/Value投影
         self.k_proj = nn.Linear(cond_dim, embed_dim)
         self.v_proj = nn.Linear(cond_dim, embed_dim)
 
@@ -142,10 +140,10 @@ class ConditionedBlock(nn.Module):
         return h
 
 
-# 简化的加法注入版本（如果您想用更简单的方式）
+# 简化的加法注入版本
 class AddConditionBlock(nn.Module):
     """
-    使用加法注入的条件块（更简单，无注意力）
+    使用加法注入的条件块
     """
 
     def __init__(self, in_ch, out_ch, time_emb_dim=None, cond_dim=None):
@@ -155,7 +153,7 @@ class AddConditionBlock(nn.Module):
         if time_emb_dim is not None:
             self.time_mlp = nn.Linear(time_emb_dim, out_ch)
 
-        # 条件投影（直接加法）
+        # 条件投影
         self.cond_mlp = None
         if cond_dim is not None:
             self.cond_mlp = nn.Sequential(
@@ -193,7 +191,7 @@ class AddConditionBlock(nn.Module):
 
 
 def get_conditioned_block(block_type="cross_attention"):
-    """根据配置选择条件块"""
+    """选择条件块"""
     if block_type == "add":
         return AddConditionBlock
     elif block_type == "cross_attention":

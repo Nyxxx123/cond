@@ -1,6 +1,6 @@
 """
 评估脚本 - 自动配对 TEST 中的真实图像与 Generated 中的生成图像
-指标：PSNR, SSIM, FID, KID
+指标：PSNR, SSIM, MS-SSIM, LPIPS, FID, KID
 """
 
 import os
@@ -8,9 +8,10 @@ import json
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, MultiScaleStructuralSimilarityIndexMeasure
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.kid import KernelInceptionDistance
+import lpips
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
@@ -90,11 +91,15 @@ def evaluate(test_root="./TEST", generated_root="./Generated", batch_size=4, dev
     # 初始化指标
     psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    ms_ssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     fid = FrechetInceptionDistance(feature=2048).to(device)
     kid = KernelInceptionDistance(subset_size=min(50, len(dataset))).to(device)
+    lpips_fn = lpips.LPIPS(net='alex').to(device)
 
     psnr_vals = []
     ssim_vals = []
+    ms_ssim_vals = []
+    lpips_vals = []
 
     print(f"Evaluating {len(dataset)} image pairs...")
     for real, fake in tqdm(dataloader):
@@ -107,6 +112,17 @@ def evaluate(test_root="./TEST", generated_root="./Generated", batch_size=4, dev
         psnr_vals.append(psnr(fake, real).item())
         ssim_vals.append(ssim(fake, real).item())
 
+        # MS-SSIM 需要三通道输入
+        real_rgb_ms = real.repeat(1, 3, 1, 1)
+        fake_rgb_ms = fake.repeat(1, 3, 1, 1)
+        ms_ssim_vals.append(ms_ssim(fake_rgb_ms, real_rgb_ms).item())
+
+        # LPIPS 需要 RGB 三通道，输入范围 [-1, 1]
+        real_rgb_norm = real.repeat(1, 3, 1, 1) * 2 - 1
+        fake_rgb_norm = fake.repeat(1, 3, 1, 1) * 2 - 1
+        vals = lpips_fn(fake_rgb_norm, real_rgb_norm).detach().cpu().view(-1).tolist()
+        lpips_vals.extend(vals)
+
         # FID/KID 需要 RGB 三通道且类型为 uint8 (0-255)
         real_rgb = (real.repeat(1, 3, 1, 1) * 255).to(torch.uint8)
         fake_rgb = (fake.repeat(1, 3, 1, 1) * 255).to(torch.uint8)
@@ -117,6 +133,8 @@ def evaluate(test_root="./TEST", generated_root="./Generated", batch_size=4, dev
 
     mean_psnr = np.mean(psnr_vals)
     mean_ssim = np.mean(ssim_vals)
+    mean_ms_ssim = np.mean(ms_ssim_vals)
+    mean_lpips = np.mean(lpips_vals)
     fid_score = fid.compute().item()
     kid_mean, kid_std = kid.compute()
     kid_mean = kid_mean.item()
@@ -125,6 +143,8 @@ def evaluate(test_root="./TEST", generated_root="./Generated", batch_size=4, dev
     results = {
         "PSNR_dB": round(mean_psnr, 4),
         "SSIM": round(mean_ssim, 6),
+        "MS_SSIM": round(mean_ms_ssim, 6),
+        "LPIPS": round(mean_lpips, 6),
         "FID": round(fid_score, 4),
         "KID_mean": round(kid_mean, 6),
         "KID_std": round(kid_std, 6),
@@ -143,8 +163,8 @@ def evaluate(test_root="./TEST", generated_root="./Generated", batch_size=4, dev
 
 if __name__ == "__main__":
     TEST_ROOT = "./TEST"
-    GENERATED_ROOT = "./Generated-l&g&s"
-    OUTPUT_FILE = "./evaluation_results-l&g&s.json"
+    GENERATED_ROOT = "./Generated-all-infor-v-ssim(0.5,lpips 0.5,no Gan)"
+    OUTPUT_FILE = "./evaluate_results/evaluation_results-all_infor-v-ssim(0.5,lpips 0.5,no Gan).json"
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     evaluate(TEST_ROOT, GENERATED_ROOT, batch_size=4, device=DEVICE, output_file=OUTPUT_FILE)

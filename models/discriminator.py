@@ -11,8 +11,6 @@ import torch.nn.functional as F
 class Discriminator(nn.Module):
     """
     PatchGAN 判别器
-    输出是一个特征图（每个patch的真实性判断），而不是单一标量
-    这种设计对小细节更敏感，训练也更稳定
     """
 
     def __init__(self, in_channels=1, base_channels=64):
@@ -89,7 +87,7 @@ class NLayerDiscriminator(nn.Module):
         return self.model(x)
 
 
-# ==================== 新增：条件判别器 ====================
+# 新增：条件判别器
 class CondDiscriminator(nn.Module):
     """
     条件 PatchGAN 判别器
@@ -146,22 +144,3 @@ class CondDiscriminator(nn.Module):
         # 输出判别分数
         out = self.out_conv(features)           # [B, 1, 16, 16]
         return out
-# =====================================================
-
-
-# 测试代码
-if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # 测试判别器
-    disc = Discriminator(in_channels=1).to(device)
-    x = torch.randn(4, 1, 256, 256).to(device)
-    out = disc(x)
-    print(f"Discriminator output shape: {out.shape}")  # [4, 1, 16, 16]
-    print(f"参数量: {sum(p.numel() for p in disc.parameters()):,}")
-
-    # 测试条件判别器
-    cond_disc = CondDiscriminator(in_channels=1, cond_dim=256).to(device)
-    cond = torch.randn(4, 256).to(device)
-    out_cond = cond_disc(x, cond)
-    print(f"CondDiscriminator output shape: {out_cond.shape}")

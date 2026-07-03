@@ -1,6 +1,5 @@
 """
 噪声调度函数
-对应博客第1.2节和第6.1节
 """
 
 import torch
@@ -9,7 +8,6 @@ import math
 def get_linear_noise_schedule(timesteps, beta_start=0.0001, beta_end=0.02):
     """
     线性噪声调度
-    对应博客第1.2节
     """
     scale = 1000 / timesteps
     beta_start_scaled = scale * beta_start
@@ -20,7 +18,6 @@ def get_linear_noise_schedule(timesteps, beta_start=0.0001, beta_end=0.02):
 def get_cosine_noise_schedule(timesteps, s=0.008):
     """
     余弦噪声调度
-    对应博客第6.1节
     """
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)

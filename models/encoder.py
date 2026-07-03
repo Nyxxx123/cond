@@ -138,7 +138,7 @@ class MaskEncoder3D(nn.Module):
         return features
 
 
-# ==================== 多模态编码器（扩展用） ====================
+# ==================== 多模态编码器 ====================
 
 class AngleEncoder(nn.Module):
     """
@@ -169,7 +169,7 @@ class AngleEncoder(nn.Module):
         return self.mlp(angle)
 
 
-# ==================== 新增：无造影CT编码器 ====================
+# ==================== 无造影CT编码器 ====================
 class XRayEncoder(nn.Module):
     """
     2D 无造影CT图像编码器
@@ -207,13 +207,13 @@ class MultiConditionEncoder(nn.Module):
                  angle_cond_dim=256,
                  use_angle=True,
                  angle_dim=4,
-                 use_non_angio=False,           # 新增参数
-                 non_angio_cond_dim=256,        # 新增参数
+                 use_non_angio=False,
+                 non_angio_cond_dim=256,
                  fused_cond_dim=256):
         super().__init__()
 
         self.use_angle = use_angle
-        self.use_non_angio = use_non_angio      # 新增
+        self.use_non_angio = use_non_angio
 
         # 掩码编码器
         if mask_type == "2d":
@@ -225,7 +225,7 @@ class MultiConditionEncoder(nn.Module):
         if use_angle:
             self.angle_encoder = AngleEncoder(angle_dim=angle_dim, cond_dim=angle_cond_dim)
 
-        # 新增：无造影CT编码器
+        # 无造影CT编码器
         if use_non_angio:
             self.non_angio_encoder = XRayEncoder(in_channels=1, cond_dim=non_angio_cond_dim)
 
@@ -252,8 +252,8 @@ class MultiConditionEncoder(nn.Module):
         """
         Args:
             mask: [B, 1, D, H, W] 或 [B, 1, H, W]
-            angle: [B, angle_dim] 四元数/旋转矩阵/欧拉角，可选
-            non_angio: [B, 1, H, W] 无造影CT图像，可选
+            angle: [B, angle_dim] 四元数/旋转矩阵/欧拉角
+            non_angio: [B, 1, H, W] 无造影CT图像
 
         Returns:
             cond: [B, fused_cond_dim] 融合后的条件向量
@@ -267,7 +267,7 @@ class MultiConditionEncoder(nn.Module):
             angle_feat = self.angle_encoder(angle)  # [B, angle_cond_dim]
             features.append(angle_feat)
 
-        # 新增：编码无造影CT
+        # 编码无造影CT
         if self.use_non_angio and non_angio is not None:
             non_angio_feat = self.non_angio_encoder(non_angio)  # [B, non_angio_cond_dim]
             features.append(non_angio_feat)
