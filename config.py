@@ -23,14 +23,14 @@ class Config:
 
     # ========== MS-SSIM感知损失配置 ==========
     use_ms_ssim = True                # 是否使用 MS-SSIM 损失
-    ms_ssim_loss_weight = 0.5        # MS-SSIM 损失权重
+    ms_ssim_loss_weight = 0.3        # MS-SSIM 损失权重
     ms_ssim_kernel_size = 11          # 高斯核大小，默认 11
     ms_ssim_sigma = 1.5               # 高斯核标准差，默认 1.5
     # =============================================
 
     # GAN配置
     use_gan = False  # 开关：True=启用GAN
-    gan_loss_weight = 1.0  # GAN损失权重
+    gan_loss_weight = 0.1  # GAN损失权重
     disc_lr = 2e-4  # 判别器学习率
     gan_start_epoch = 250
 
